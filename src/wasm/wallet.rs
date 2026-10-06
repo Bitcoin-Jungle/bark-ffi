@@ -180,6 +180,15 @@ pub struct UnlockVtxosArgs {
 
 #[derive(Serialize, Deserialize, Tsify)]
 #[serde(rename_all = "camelCase")]
+pub struct ListExitsArgs {
+    #[tsify(optional)]
+    pub includeHistory: Option<bool>,
+    #[tsify(optional)]
+    pub includeTransactions: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
 pub struct TryClaimLightningReceiveArgs {
     pub paymentHash: String,
     #[tsify(optional)]
@@ -933,6 +942,34 @@ impl Wallet {
     #[wasm_bindgen(js_name = getExitVtxos)]
     pub async fn get_exit_vtxos(&self) -> Result<Vec<Ts<ExitVtxo>>, JsError> {
         Ok(self.core.get_exit_vtxos().await?.into_iter().map(|v| v.into_ts()).collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Status of every exit this wallet ever started, live and finished.
+    #[wasm_bindgen(js_name = listAllExits)]
+    pub async fn list_all_exits(&self, args: Ts<ListExitsArgs>) -> Result<Vec<Ts<ExitTransactionStatus>>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self.core.list_all_exits(
+            args.includeHistory.unwrap_or(false), args.includeTransactions.unwrap_or(false),
+        ).await?.into_iter().map(|v| v.into_ts()).collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Status of the exits that are still progressing.
+    #[wasm_bindgen(js_name = listLiveExits)]
+    pub async fn list_live_exits(&self, args: Ts<ListExitsArgs>) -> Result<Vec<Ts<ExitTransactionStatus>>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self.core.list_live_exits(
+            args.includeHistory.unwrap_or(false), args.includeTransactions.unwrap_or(false),
+        ).await?.into_iter().map(|v| v.into_ts()).collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Status of the exits in a terminal state. They stay queryable after
+    /// completion.
+    #[wasm_bindgen(js_name = listFinishedExits)]
+    pub async fn list_finished_exits(&self, args: Ts<ListExitsArgs>) -> Result<Vec<Ts<ExitTransactionStatus>>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self.core.list_finished_exits(
+            args.includeHistory.unwrap_or(false), args.includeTransactions.unwrap_or(false),
+        ).await?.into_iter().map(|v| v.into_ts()).collect::<Result<Vec<_>, _>>()?)
     }
 
     #[wasm_bindgen(js_name = hasPendingExits)]

@@ -810,9 +810,55 @@ impl Wallet {
         run_async(async move { core.list_claimable_exits().await }).await
     }
 
+    /// Live exits only. Finished exits leave this list; see
+    /// `list_finished_exits` and `get_exit_status`.
     pub async fn get_exit_vtxos(&self) -> Result<Vec<types::ExitVtxo>, Error> {
         let core = self.core.clone();
         run_async(async move { core.get_exit_vtxos().await }).await
+    }
+
+    /// Status of every exit this wallet ever started, live and finished.
+    #[uniffi::method(default(include_history = false, include_transactions = false))]
+    pub async fn list_all_exits(
+        &self,
+        include_history: bool,
+        include_transactions: bool,
+    ) -> Result<Vec<types::ExitTransactionStatus>, Error> {
+        let core = self.core.clone();
+        run_async(async move {
+            core.list_all_exits(include_history, include_transactions).await
+        })
+        .await
+    }
+
+    /// Status of the exits that are still progressing.
+    #[uniffi::method(default(include_history = false, include_transactions = false))]
+    pub async fn list_live_exits(
+        &self,
+        include_history: bool,
+        include_transactions: bool,
+    ) -> Result<Vec<types::ExitTransactionStatus>, Error> {
+        let core = self.core.clone();
+        run_async(async move {
+            core.list_live_exits(include_history, include_transactions).await
+        })
+        .await
+    }
+
+    /// Status of the exits in a terminal state: claimed, canceled, or aborted
+    /// because the VTXO was already spent or swept. They stay queryable after
+    /// completion, so a client need not snapshot them at drain time.
+    #[uniffi::method(default(include_history = false, include_transactions = false))]
+    pub async fn list_finished_exits(
+        &self,
+        include_history: bool,
+        include_transactions: bool,
+    ) -> Result<Vec<types::ExitTransactionStatus>, Error> {
+        let core = self.core.clone();
+        run_async(async move {
+            core.list_finished_exits(include_history, include_transactions).await
+        })
+        .await
     }
 
     pub async fn has_pending_exits(&self) -> Result<bool, Error> {
@@ -830,6 +876,8 @@ impl Wallet {
         run_async(async move { core.all_exits_claimable_at_height().await }).await
     }
 
+    /// Status of one exit, live or finished. `None` if no exit was ever
+    /// started for the VTXO.
     pub async fn get_exit_status(
         &self,
         vtxo_id: String,
