@@ -531,6 +531,12 @@ impl From<bark::actions::lightning::receive::LightningReceiveState> for Lightnin
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LightningSend {
     pub invoice: String,
+    /// Payment hash of the invoice being paid. Poll `lightning_send_state`
+    /// with it; for BOLT12 there is no invoice string to parse it from.
+    pub payment_hash: String,
+    /// Id of the `Movement` that records this send. `None` only for sends
+    /// checkpointed by a bark version that predates the field.
+    pub movement_id: Option<u32>,
     /// Amount being paid, in sats (`payment_amount`).
     pub amount_sats: u64,
     /// Routing/ark fee for the send, in sats.
@@ -545,6 +551,8 @@ pub struct LightningSend {
 impl From<bark::actions::lightning::pay::LightningSend> for LightningSend {
     fn from(s: bark::actions::lightning::pay::LightningSend) -> Self {
         Self {
+            payment_hash: s.invoice.payment_hash().to_string(),
+            movement_id: s.movement_id.map(|m| m.0),
             invoice: s.invoice.to_string(),
             amount_sats: s.payment_amount.to_sat(),
             fee_sats: s.fee.to_sat(),
@@ -918,6 +926,8 @@ pub struct PendingBoard {
     pub vtxo_id: String,
     pub amount_sats: u64,
     pub txid: String,
+    /// Id of the `Movement` that records this board.
+    pub movement_id: u32,
 }
 
 impl From<BarkPendingBoard> for PendingBoard {
@@ -926,6 +936,7 @@ impl From<BarkPendingBoard> for PendingBoard {
             vtxo_id: pb.vtxos.first().map(|v| v.to_string()).unwrap_or_default(),
             amount_sats: pb.amount.to_sat(),
             txid: pb.funding_tx.compute_txid().to_string(),
+            movement_id: pb.movement_id.0,
         }
     }
 }
@@ -1542,6 +1553,12 @@ impl From<BarkExitProgressStatus> for ExitProgressStatus {
 pub struct ExitClaimTransaction {
     pub psbt_base64: String,
     pub fee_sats: u64,
+    /// The exits the PSBT actually spends. Link the claim transaction to
+    /// these, not to the ids you asked for.
+    pub vtxo_ids: Vec<String>,
+    /// Requested ids that were left out because they were not claimable when
+    /// the PSBT was built. Empty when draining all claimable exits.
+    pub skipped_vtxo_ids: Vec<String>,
 }
 
 /// Detailed status of an exit transaction

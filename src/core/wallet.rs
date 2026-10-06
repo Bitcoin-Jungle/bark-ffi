@@ -1565,6 +1565,18 @@ impl Wallet {
             return Err(anyhow::anyhow!("No claimable exits found").into());
         }
 
+        // Report what the PSBT really spends. An id can stop being claimable
+        // between `list_claimable_exits` and this call, so the caller must not
+        // assume every requested id made it in. Compare parsed ids, so an id
+        // spelled differently from bark's canonical form is not misreported.
+        let drained: Vec<VtxoId> = to_drain.iter().map(|ev| ev.id()).collect();
+        let skipped_vtxo_ids: Vec<String> = parse_vtxo_ids(&vtxo_ids)?
+            .into_iter()
+            .filter(|id| !drained.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+        let drained_ids: Vec<String> = drained.iter().map(|id| id.to_string()).collect();
+
         let psbt = exit_guard
             .drain_exits(&to_drain, &self.inner, addr, fee_rate)
             .await
@@ -1584,6 +1596,8 @@ impl Wallet {
         Ok(types::ExitClaimTransaction {
             psbt_base64,
             fee_sats: fee_sats.to_sat(),
+            vtxo_ids: drained_ids,
+            skipped_vtxo_ids,
         })
     }
 
