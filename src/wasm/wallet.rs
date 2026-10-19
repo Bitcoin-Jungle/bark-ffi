@@ -13,11 +13,11 @@ use crate::core::onchain::OnchainWallet as CoreOnchainWallet;
 use crate::core::wallet::{seed_from_str, OpenArgs as CoreOpenArgs, Wallet as CoreWallet};
 use crate::error::Error;
 use crate::types::{
-    AddressWithIndex, ArkInfo, Balance, BalanceSummary, BoardFundingInfo, DebugInfo,
-    EmergencyExitFeeEstimate,
-    ExitCancelResult, ExitClaimTransaction, ExitProgressStatus, ExitTransactionStatus, ExitVtxo,
-    FeeEstimate, ImportVtxoArgs, LightningInvoice,
-    LightningReceive, LightningSend, LightningSendStatus, Movement, Network, OffboardResult,
+    AddressWithIndex, ArkInfo, Balance, BalanceSummary, Bip321Uri, Bip321UriOptions,
+    BoardFundingInfo, DebugInfo, EmergencyExitFeeEstimate, ExitCancelResult,
+    ExitClaimTransaction, ExitProgressStatus, ExitTransactionStatus, ExitVtxo, FeeEstimate,
+    ImportVtxoArgs, LightningInvoice, LightningReceive, LightningSend, LightningSendStatus,
+    Movement, Network, OffboardResult, PaymentMethod, PaymentRequest, PaymentResult,
     PendingBoard, RecoveryReport, RecoveryStatus, RoundState, Vtxo, VtxoLockHolder,
     WalletProperties,
 };
@@ -95,6 +95,31 @@ pub struct PayLnurlArgs {
     pub wait: Option<bool>,
     /// Seconds the Ark server keeps trying to pay, capped to the server's
     /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimatePaymentFeeArgs {
+    pub method: PaymentMethod,
+    pub amountSats: u64,
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct SendPaymentArgs {
+    pub method: PaymentMethod,
+    #[tsify(optional)]
+    pub amountSats: Option<u64>,
+    /// Only sent to lightning addresses and LNURL.
+    #[tsify(optional)]
+    pub comment: Option<String>,
+    #[tsify(optional)]
+    pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    /// Only affects lightning.
     #[tsify(optional)]
     pub retryForSecs: Option<u64>,
 }
@@ -699,6 +724,69 @@ impl Wallet {
     #[wasm_bindgen(js_name = sendOnchain)]
     pub async fn send_onchain(&self, address: String, amountSats: f64) -> Result<Ts<OffboardResult>, JsError> {
         Ok(self.core.send_onchain(address, amountSats as u64).await?.into_ts()?)
+    }
+
+    // -- Payment requests -----------------------------------------------------
+
+    /// Parse any payment string bark understands: a BIP 321 `bitcoin:` URI, a
+    /// `lightning:` URI (any case), a BOLT11 invoice, a BOLT12 offer, a
+    /// lightning address, an LNURL-pay link or LUD-17 `lnurlp://` URI, an Ark
+    /// address, a bitcoin address or a hex output script. Surrounding
+    /// whitespace is not trimmed.
+    ///
+    /// Problems with a single option are reported in that option's `errors`.
+    /// Throws only when nothing in the string can be paid at all.
+    #[wasm_bindgen(js_name = parsePaymentRequest)]
+    pub async fn parse_payment_request(
+        &self,
+        payment: String,
+    ) -> Result<Ts<PaymentRequest>, JsError> {
+        Ok(self.core.parse_payment_request(payment).await?.into_ts()?)
+    }
+
+    #[wasm_bindgen(js_name = estimatePaymentFee)]
+    pub async fn estimate_payment_fee(
+        &self,
+        args: Ts<EstimatePaymentFeeArgs>,
+    ) -> Result<Ts<FeeEstimate>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self.core.estimate_payment_fee(args.method, args.amountSats).await?.into_ts()?)
+    }
+
+    /// Pay `method` over the matching rail: Ark, lightning or onchain.
+    ///
+    /// `amountSats` is required for addresses and LNURL, and for invoices and
+    /// offers without an amount (`AvailablePaymentMethod.requiresAmount`).
+    /// LNURL endpoints are fetched cross-origin, as in `payLightningAddress`.
+    #[wasm_bindgen(js_name = sendPayment)]
+    pub async fn send_payment(
+        &self,
+        args: Ts<SendPaymentArgs>,
+    ) -> Result<Ts<PaymentResult>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self
+            .core
+            .send_payment(
+                args.method,
+                args.amountSats,
+                args.comment,
+                args.wait.unwrap_or(false),
+                args.retryForSecs,
+            )
+            .await?
+            .into_ts()?)
+    }
+
+    /// Build a BIP 321 `bitcoin:` URI with a new Ark address, a new BOLT11
+    /// invoice (when there is an amount) and the caller's onchain address,
+    /// as `options` selects.
+    #[wasm_bindgen(js_name = bip321Uri)]
+    pub async fn bip321_uri(
+        &self,
+        options: Ts<Bip321UriOptions>,
+    ) -> Result<Ts<Bip321Uri>, JsError> {
+        let options = options.to_rust()?;
+        Ok(self.core.bip321_uri(options).await?.into_ts()?)
     }
 
     // -- History --------------------------------------------------------------

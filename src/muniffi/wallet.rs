@@ -559,6 +559,73 @@ impl Wallet {
     }
 
     // ------------------------------------------------------------------------
+    // Payment requests
+    // ------------------------------------------------------------------------
+
+    /// Parse any payment string bark understands: a BIP 321 `bitcoin:` URI, a
+    /// `lightning:` URI (any case), a BOLT11 invoice, a BOLT12 offer, a
+    /// lightning address, an LNURL-pay link or LUD-17 `lnurlp://` URI, an Ark
+    /// address, a bitcoin address or a hex output script. Surrounding
+    /// whitespace is not trimmed.
+    ///
+    /// Problems with a single option (wrong network, an Ark address of
+    /// another server, an amount mismatch) are reported in that option's
+    /// `errors`. Errors only when nothing in the string can be paid at all.
+    /// Checking an Ark address needs a server connection.
+    pub async fn parse_payment_request(
+        &self,
+        payment: String,
+    ) -> Result<types::PaymentRequest, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.parse_payment_request(payment).await }).await
+    }
+
+    /// Estimate the fee of paying `amount_sats` to `method`.
+    pub async fn estimate_payment_fee(
+        &self,
+        method: types::PaymentMethod,
+        amount_sats: u64,
+    ) -> Result<types::FeeEstimate, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.estimate_payment_fee(method, amount_sats).await }).await
+    }
+
+    /// Pay `method` over the matching rail: Ark, lightning or onchain.
+    ///
+    /// `amount_sats` is required for addresses and LNURL, and for invoices
+    /// and offers without an amount (`AvailablePaymentMethod.requires_amount`).
+    /// `comment` only reaches lightning addresses and LNURL. `wait` and
+    /// `retry_for_secs` only affect lightning. `retry_for_secs` is how long
+    /// the Ark server keeps trying to pay, capped to the server's maximum;
+    /// `None` leaves it to the server and 0 makes a single attempt.
+    #[uniffi::method(default(amount_sats = None, comment = None, wait = false, retry_for_secs = None))]
+    pub async fn send_payment(
+        &self,
+        method: types::PaymentMethod,
+        amount_sats: Option<u64>,
+        comment: Option<String>,
+        wait: bool,
+        retry_for_secs: Option<u64>,
+    ) -> Result<types::PaymentResult, Error> {
+        let core = self.core.clone();
+        run_async(async move {
+            core.send_payment(method, amount_sats, comment, wait, retry_for_secs).await
+        })
+        .await
+    }
+
+    /// Build a BIP 321 `bitcoin:` URI with a new Ark address, a new BOLT11
+    /// invoice (when there is an amount) and the caller's onchain address,
+    /// as `options` selects.
+    pub async fn bip321_uri(
+        &self,
+        options: types::Bip321UriOptions,
+    ) -> Result<types::Bip321Uri, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.bip321_uri(options).await }).await
+    }
+
+    // ------------------------------------------------------------------------
     // History
     // ------------------------------------------------------------------------
 
