@@ -1000,10 +1000,17 @@ impl Wallet {
         method: types::PaymentMethod,
         amount_sats: u64,
     ) -> Result<types::FeeEstimate, Error> {
-        let option = bark::AvailablePaymentMethod {
-            method: method.to_bark().context("invalid payment method")?,
-            errors: vec![],
-        };
+        let method = method.to_bark().context("invalid payment method")?;
+        // bark assumes a bitcoin address is on the wallet's network here, so
+        // check it like `send_payment` does rather than estimate an unpayable fee.
+        if let bark::movement::PaymentMethod::Bitcoin(address) = &method {
+            let network = self.inner.network().await?;
+            address
+                .clone()
+                .require_network(network)
+                .with_context(|| format!("bitcoin address is not valid on {}", network))?;
+        }
+        let option = bark::AvailablePaymentMethod { method, errors: vec![] };
         let amount = bitcoin::Amount::from_sat(amount_sats);
         Ok(self.inner.estimate_payment_fee(&option, amount).await?.into())
     }
