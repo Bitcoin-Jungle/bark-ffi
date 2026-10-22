@@ -345,6 +345,13 @@ impl Wallet {
         Ok(self.inner.balance().await?.into())
     }
 
+    /// The numbers to show a user, without the breakdown of [`Self::balance`]:
+    /// what they can spend, what needs a refresh, what is pending and the
+    /// total.
+    pub async fn balance_summary(&self) -> Result<types::BalanceSummary, Error> {
+        Ok(self.inner.balance().await?.summary().into())
+    }
+
     pub async fn vtxos(&self) -> Result<Vec<types::Vtxo>, Error> {
         Ok(self
             .inner
@@ -384,9 +391,13 @@ impl Wallet {
         &self,
         threshold_blocks: u32,
     ) -> Result<Vec<types::Vtxo>, Error> {
+        // Saturating is lossless: a VTXO's lifetime is itself a u16 block
+        // count, so u16::MAX already covers every VTXO.
+        let threshold = bark_bitcoin_ext::BlockDelta::try_from(threshold_blocks)
+            .unwrap_or(bark_bitcoin_ext::BlockDelta::new(u16::MAX));
         Ok(self
             .inner
-            .get_expiring_vtxos(threshold_blocks)
+            .get_expiring_vtxos(threshold)
             .await?
             .into_iter()
             .map(Into::into)
@@ -560,10 +571,7 @@ impl Wallet {
     ) -> Result<types::OffboardResult, Error> {
         let addr = parse_address(&bitcoin_address, self.inner.network().await?)?;
 
-        let txid = self.inner.offboard_all(addr).await?;
-        Ok(types::OffboardResult {
-            txid: txid.to_string(),
-        })
+        Ok(self.inner.offboard_all(addr).await?.into())
     }
 
     pub async fn offboard_vtxos(
@@ -578,14 +586,15 @@ impl Wallet {
             .map(|id| id.parse::<VtxoId>().context("invalid vtxo id"))
             .collect();
 
-        let txid = self.inner.offboard_vtxos(ids?, addr).await?;
-        Ok(types::OffboardResult {
-            txid: txid.to_string(),
-        })
+        Ok(self.inner.offboard_vtxos(ids?, addr).await?.into())
     }
 
     // ------------------------------------------------------------------------
     // Lightning (send)
+    //
+    // `retry_for_secs` is how long the Ark server keeps trying to pay, capped
+    // to the server's maximum; `None` leaves it to the server and 0 makes a
+    // single attempt.
     // ------------------------------------------------------------------------
 
     pub async fn pay_lightning_invoice(
@@ -593,12 +602,13 @@ impl Wallet {
         invoice: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let invoice: Invoice = invoice.parse().context("invalid invoice")?;
         let amount = amount_sats.map(bitcoin::Amount::from_sat);
         let resolved = self
             .inner
-            .pay_lightning_invoice(invoice, amount, wait)
+            .pay_lightning_invoice_with(invoice, amount, lightning_send_options(wait, retry_for_secs))
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -608,13 +618,14 @@ impl Wallet {
         offer: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let offer_obj = Offer::from_str(&offer)
             .map_err(|e| anyhow::anyhow!("invalid BOLT12 offer: {e:?}"))?;
         let amount = amount_sats.map(bitcoin::Amount::from_sat);
         let resolved = self
             .inner
-            .pay_lightning_offer(offer_obj, amount, wait)
+            .pay_lightning_offer_with(offer_obj, amount, lightning_send_options(wait, retry_for_secs))
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -632,6 +643,7 @@ impl Wallet {
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let addr: bark::lnurllib::lightning_address::LightningAddress = lightning_address
             .trim()
@@ -640,7 +652,9 @@ impl Wallet {
         let amount = bitcoin::Amount::from_sat(amount_sats);
         let resolved = self
             .inner
-            .pay_lightning_address(&addr, amount, comment.as_deref(), wait)
+            .pay_lightning_address_with(
+                &addr, amount, comment.as_deref(), lightning_send_options(wait, retry_for_secs),
+            )
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -657,13 +671,16 @@ impl Wallet {
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let lnurl: bark::lnurllib::lnurl::LnUrl =
             lnurl.trim().parse().context("invalid lnurl")?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
         let resolved = self
             .inner
-            .pay_lnurl(&lnurl, amount, comment.as_deref(), wait)
+            .pay_lnurl_with(
+                &lnurl, amount, comment.as_deref(), lightning_send_options(wait, retry_for_secs),
+            )
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -898,15 +915,17 @@ impl Wallet {
     /// An address this bark cannot deliver to (see
     /// [`Self::validate_arkoor_address`]) is rejected up front, leaving the
     /// selected VTXOs spendable, rather than cosigned and then retried forever.
+    ///
+    /// Returns the id of the movement that records the payment.
     pub async fn send_arkoor_payment(
         &self,
         ark_address: String,
         amount_sats: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         let addr: ark::Address = ark_address.parse().context("invalid ark address")?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
-        self.inner.send_arkoor_payment(&addr, amount).await?;
-        Ok(())
+        let movement_id = self.inner.send_arkoor_payment(&addr, amount).await?;
+        Ok(movement_id.0)
     }
 
     /// Whether this wallet can pay `address` out-of-round: same network and
@@ -926,15 +945,16 @@ impl Wallet {
     // Onchain send (from offchain balance)
     // ------------------------------------------------------------------------
 
+    /// Send `amount_sats` from the offchain balance to an onchain address,
+    /// as an offboard. Returns the offboard txid and its movement id.
     pub async fn send_onchain(
         &self,
         address: String,
         amount_sats: u64,
-    ) -> Result<String, Error> {
+    ) -> Result<types::OffboardResult, Error> {
         let addr = parse_address(&address, self.inner.network().await?)?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
-        let txid = self.inner.send_onchain(addr, amount).await?;
-        Ok(txid.to_string())
+        Ok(self.inner.send_onchain(addr, amount).await?.into())
     }
 
     // ------------------------------------------------------------------------
@@ -1022,7 +1042,7 @@ impl Wallet {
 
         let state = self
             .inner
-            .refresh_vtxos_scheduled(ids, scheduled_height)
+            .refresh_vtxos_scheduled(ids, scheduled_height.into())
             .await?;
         Ok(state.map(|s| s.into()))
     }
@@ -1086,13 +1106,13 @@ impl Wallet {
                 .map(|p| p.to_string_lossy().to_string()),
             bitcoind_user: cfg.bitcoind_user.clone(),
             bitcoind_pass: None,
-            vtxo_refresh_expiry_threshold: Some(cfg.vtxo_refresh_expiry_threshold),
-            vtxo_exit_margin: Some(cfg.vtxo_exit_margin),
-            htlc_recv_claim_delta: Some(cfg.htlc_recv_claim_delta),
+            vtxo_refresh_expiry_threshold: Some(cfg.vtxo_refresh_expiry_threshold.to_u16()),
+            vtxo_exit_margin: Some(cfg.vtxo_exit_margin.to_u16()),
+            htlc_recv_claim_delta: Some(cfg.htlc_recv_claim_delta.to_u16()),
             fallback_fee_rate: cfg.fallback_fee_rate.map(|r| r.to_sat_per_kwu()),
-            round_tx_required_confirmations: Some(cfg.round_tx_required_confirmations),
+            round_tx_required_confirmations: Some(cfg.round_tx_required_confirmations.to_u32()),
             daemon_sync_interval_secs: Some(cfg.daemon_sync_interval_secs),
-            offboard_required_confirmations: Some(cfg.offboard_required_confirmations),
+            offboard_required_confirmations: Some(cfg.offboard_required_confirmations.to_u32()),
             daemon_manual_sync: Some(cfg.daemon_manual_sync),
             lightning_receive_claim_retries: Some(cfg.lightning_receive_claim_retries),
             user_agent: cfg.user_agent.clone(),
@@ -1184,7 +1204,7 @@ impl Wallet {
 
         Ok(types::BoardFundingInfo {
             address: address.to_string(),
-            expiry_height,
+            expiry_height: expiry_height.to_u32(),
             keypair_index,
         })
     }
@@ -1216,7 +1236,7 @@ impl Wallet {
 
         let pb = self
             .inner
-            .board_psbt(psbt, keypair, expiry_height)
+            .board_psbt(psbt, keypair, expiry_height.into())
             .await
             .context("Board psbt failed")?;
 
@@ -1470,17 +1490,16 @@ impl Wallet {
         Ok(exit_guard.has_pending_exits().await)
     }
 
+    /// Sats in VTXOs whose exit has committed on chain but has not been
+    /// claimed yet: `balance().pending_exit_sats`.
     pub async fn pending_exits_total_sats(&self) -> Result<u64, Error> {
-        let exit_guard = self.inner.exit_mgr();
-        Ok(exit_guard
-            .try_pending_total()
-            .unwrap_or(bitcoin::Amount::ZERO)
-            .to_sat())
+        let balance = self.inner.balance().await.context("Failed to compute balance")?;
+        Ok(balance.pending_exit.to_sat())
     }
 
     pub async fn all_exits_claimable_at_height(&self) -> Result<Option<u32>, Error> {
         let exit_guard = self.inner.exit_mgr();
-        Ok(exit_guard.all_claimable_at_height().await)
+        Ok(exit_guard.all_claimable_at_height().await.map(|h| h.to_u32()))
     }
 
     pub async fn get_exit_status(
@@ -1633,11 +1652,11 @@ impl Wallet {
     // ------------------------------------------------------------------------
 
     pub async fn get_first_expiring_vtxo_blockheight(&self) -> Result<Option<u32>, Error> {
-        Ok(self.inner.get_first_expiring_vtxo_blockheight().await?)
+        Ok(self.inner.get_first_expiring_vtxo_blockheight().await?.map(|h| h.to_u32()))
     }
 
     pub async fn get_next_required_refresh_blockheight(&self) -> Result<Option<u32>, Error> {
-        Ok(self.inner.get_next_required_refresh_blockheight().await?)
+        Ok(self.inner.get_next_required_refresh_blockheight().await?.map(|h| h.to_u32()))
     }
 
     // ------------------------------------------------------------------------
@@ -1671,6 +1690,12 @@ impl Wallet {
     pub fn mailbox_identifier(&self) -> Result<String, Error> {
         let identifier = self.inner.mailbox_identifier();
         Ok(hex::encode(identifier.serialize()))
+    }
+
+    /// The network, mailbox id and VTXO xpub, as `bark debug-info` prints
+    /// them, for support requests.
+    pub async fn debug_info(&self) -> Result<types::DebugInfo, Error> {
+        Ok(self.inner.debug_info().await?.into())
     }
 
     /// Hex-encoded authorization to read this wallet's mailbox.
@@ -1899,17 +1924,21 @@ impl Wallet {
     /// affects the claim transaction's weight; when `None` a placeholder P2TR
     /// address on the wallet's network is used.
     ///
-    /// The estimate reflects current chain state: exit transactions already
-    /// confirmed cost nothing. The onchain wallet is synced first so that
-    /// `fundable` sees the current confirmed balance.
+    /// `fee_margin` scales the broadcast leg to cover feerate movement and
+    /// UTXO consolidation; it must be finite and non-negative and defaults to
+    /// bark's 1.2.
     ///
-    /// Requires an onchain wallet that can simulate the CPFP walk (the BDK
-    /// wallet does; uniffi callback wallets do not and return an error).
+    /// The estimate reflects current chain state: exit transactions already
+    /// confirmed cost nothing. It is pure weight arithmetic and never reads
+    /// the onchain wallet, so it works before the wallet holds funds and with
+    /// any onchain wallet. Only the deprecated `fundable` reads its last
+    /// synced balance.
     pub async fn estimate_emergency_exit_fee(
         &self,
         vtxo_ids: Vec<String>,
         fee_rate_sat_per_vb: Option<u64>,
         destination: Option<String>,
+        fee_margin: Option<f64>,
     ) -> Result<types::EmergencyExitFeeEstimate, Error> {
         let ids = if vtxo_ids.is_empty() {
             self.inner
@@ -1933,20 +1962,28 @@ impl Wallet {
             None => None,
         };
 
-        // Sync the onchain wallet so the `fundable` check sees current
-        // confirmed funds, like bark-rest does.
-        self.inner
-            .sync_onchain()
-            .await
-            .context("Failed to sync onchain wallet")?;
-
         let estimate = self
             .inner
-            .estimate_emergency_exit_fee(&ids, fee_rate, destination)
+            .estimate_emergency_exit_fee(&ids, fee_rate, destination, fee_margin)
             .await
             .context("Failed to estimate emergency exit fee")?;
-        Ok(estimate.into())
+
+        // Only feeds the deprecated `fundable`, so the last synced balance
+        // will do, like bark-rest.
+        let onchain_balance = match self.inner.onchain() {
+            Some(w) => Some(w.read().await.balance().await),
+            None => None,
+        };
+
+        Ok(types::EmergencyExitFeeEstimate::new(estimate, onchain_balance))
     }
+}
+
+/// bark's options for a lightning send.
+fn lightning_send_options(wait: bool, retry_for_secs: Option<u64>) -> bark::LightningSendOptions {
+    bark::LightningSendOptions::default()
+        .wait(wait)
+        .retry_for(retry_for_secs.map(std::time::Duration::from_secs))
 }
 
 /// Absolute expiry `expiry_secs` from now.
@@ -2061,6 +2098,17 @@ mod tests {
         let vtxo = parse_vtxo(BOARD_VTXO_HEX).unwrap();
         let id_str = vtxo.id().to_string();
         assert_eq!(id_str.parse::<VtxoId>().unwrap(), vtxo.id());
+    }
+
+    #[test]
+    fn lightning_send_options_carry_wait_and_retry_for() {
+        let opts = lightning_send_options(true, Some(30));
+        assert!(opts.wait);
+        assert_eq!(opts.retry_for, Some(std::time::Duration::from_secs(30)));
+
+        let opts = lightning_send_options(false, None);
+        assert!(!opts.wait);
+        assert_eq!(opts.retry_for, None);
     }
 
     #[test]

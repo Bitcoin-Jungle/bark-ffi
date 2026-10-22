@@ -196,6 +196,13 @@ impl Wallet {
         run_async(async move { core.balance().await }).await
     }
 
+    /// The numbers to show a user, without the breakdown of `balance`: what
+    /// they can spend, what needs a refresh, what is pending and the total.
+    pub async fn balance_summary(&self) -> Result<types::BalanceSummary, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.balance_summary().await }).await
+    }
+
     pub async fn vtxos(&self) -> Result<Vec<types::Vtxo>, Error> {
         let core = self.core.clone();
         run_async(async move { core.vtxos().await }).await
@@ -288,29 +295,39 @@ impl Wallet {
     // Lightning (send)
     // ------------------------------------------------------------------------
 
-    #[uniffi::method(default(wait = false))]
+    /// Pay a BOLT11 invoice.
+    ///
+    /// `retry_for_secs` is how long the Ark server keeps trying to pay,
+    /// capped to the server's maximum; `None` leaves it to the server and 0
+    /// makes a single attempt. The same holds for every `pay_*` method.
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lightning_invoice(
         &self,
         invoice: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
-        run_async(async move { core.pay_lightning_invoice(invoice, amount_sats, wait).await }).await
+        run_async(async move {
+            core.pay_lightning_invoice(invoice, amount_sats, wait, retry_for_secs).await
+        })
+        .await
     }
 
     /// Pay to a Lightning Address (`user@domain`), resolved via LNURL-pay.
-    #[uniffi::method(default(wait = false))]
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lightning_address(
         &self,
         lightning_address: String,
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
         run_async(async move {
-            core.pay_lightning_address(lightning_address, amount_sats, comment, wait)
+            core.pay_lightning_address(lightning_address, amount_sats, comment, wait, retry_for_secs)
                 .await
         })
         .await
@@ -320,27 +337,35 @@ impl Wallet {
     ///
     /// Resolves the LNURL-pay endpoint to a BOLT11 invoice and pays it. Errors
     /// if the link decodes to a non-pay LNURL (auth, withdraw, channel).
-    #[uniffi::method(default(wait = false))]
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lnurl(
         &self,
         lnurl: String,
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
-        run_async(async move { core.pay_lnurl(lnurl, amount_sats, comment, wait).await }).await
+        run_async(async move {
+            core.pay_lnurl(lnurl, amount_sats, comment, wait, retry_for_secs).await
+        })
+        .await
     }
 
-    #[uniffi::method(default(wait = false))]
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lightning_offer(
         &self,
         offer: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
-        run_async(async move { core.pay_lightning_offer(offer, amount_sats, wait).await }).await
+        run_async(async move {
+            core.pay_lightning_offer(offer, amount_sats, wait, retry_for_secs).await
+        })
+        .await
     }
 
     #[uniffi::method(default(wait = false))]
@@ -502,11 +527,13 @@ impl Wallet {
     ///
     /// An address this bark cannot deliver to (see `validateArkoorAddress`) is
     /// rejected up front, leaving the VTXOs spendable rather than cosigned.
+    ///
+    /// Returns the id of the movement that records the payment.
     pub async fn send_arkoor_payment(
         &self,
         ark_address: String,
         amount_sats: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         let core = self.core.clone();
         run_async(async move { core.send_arkoor_payment(ark_address, amount_sats).await }).await
     }
@@ -520,11 +547,13 @@ impl Wallet {
         run_async(async move { core.validate_arkoor_address(address).await }).await
     }
 
+    /// Send `amount_sats` from the offchain balance to an onchain address,
+    /// as an offboard. Returns the offboard txid and its movement id.
     pub async fn send_onchain(
         &self,
         address: String,
         amount_sats: u64,
-    ) -> Result<String, Error> {
+    ) -> Result<types::OffboardResult, Error> {
         let core = self.core.clone();
         run_async(async move { core.send_onchain(address, amount_sats).await }).await
     }
@@ -905,6 +934,13 @@ impl Wallet {
         self.core.mailbox_identifier()
     }
 
+    /// The network, mailbox id and VTXO xpub, as `bark debug-info` prints
+    /// them. Users can share this in support requests.
+    pub async fn debug_info(&self) -> Result<types::DebugInfo, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.debug_info().await }).await
+    }
+
     /// Create a hex-encoded authorization that lets whoever holds it read this
     /// wallet's mailbox from the Ark server for `expiry_secs` from now, so 86400
     /// for 24 hours. An authorization cannot be revoked early, so keep the
@@ -1039,20 +1075,23 @@ impl Wallet {
     /// spendable VTXO). `fee_rate_sat_per_vb` applies to both legs; omit it to
     /// use the chain's fast rate for the broadcast leg and regular rate for
     /// the claim leg. `destination` only affects the claim transaction's weight.
+    /// `fee_margin` scales the broadcast leg (finite and non-negative; default
+    /// 1.2).
     ///
-    /// The onchain wallet is synced first so `fundable` reflects the current
-    /// confirmed balance. Requires a BDK onchain wallet: callback-backed
-    /// wallets (`CustomOnchainWalletCallbacks`) cannot simulate the CPFP walk
-    /// and return an error.
+    /// The estimate never reads the onchain wallet, so it works before the
+    /// wallet holds funds and with callback wallets
+    /// (`CustomOnchainWalletCallbacks`) too.
+    #[uniffi::method(default(fee_margin = None))]
     pub async fn estimate_emergency_exit_fee(
         &self,
         vtxo_ids: Vec<String>,
         fee_rate_sat_per_vb: Option<u64>,
         destination: Option<String>,
+        fee_margin: Option<f64>,
     ) -> Result<types::EmergencyExitFeeEstimate, Error> {
         let core = self.core.clone();
         run_async(async move {
-            core.estimate_emergency_exit_fee(vtxo_ids, fee_rate_sat_per_vb, destination).await
+            core.estimate_emergency_exit_fee(vtxo_ids, fee_rate_sat_per_vb, destination, fee_margin).await
         })
         .await
     }

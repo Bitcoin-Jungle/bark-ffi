@@ -88,25 +88,25 @@ impl Config {
         ret.bitcoind_pass = self.bitcoind_pass.map(bark::secret::Secret::new);
 
         if let Some(threshold) = self.vtxo_refresh_expiry_threshold {
-            ret.vtxo_refresh_expiry_threshold = threshold;
+            ret.vtxo_refresh_expiry_threshold = threshold.into();
         }
         if let Some(margin) = self.vtxo_exit_margin {
-            ret.vtxo_exit_margin = margin;
+            ret.vtxo_exit_margin = margin.into();
         }
         if let Some(delta) = self.htlc_recv_claim_delta {
-            ret.htlc_recv_claim_delta = delta;
+            ret.htlc_recv_claim_delta = delta.into();
         }
         if let Some(rate) = self.fallback_fee_rate {
             ret.fallback_fee_rate = Some(bitcoin::FeeRate::from_sat_per_kwu(rate));
         }
         if let Some(confs) = self.round_tx_required_confirmations {
-            ret.round_tx_required_confirmations = confs;
+            ret.round_tx_required_confirmations = block_delta(confs, "round_tx_required_confirmations")?;
         }
         if let Some(secs) = self.daemon_sync_interval_secs {
             ret.daemon_sync_interval_secs = secs;
         }
         if let Some(confs) = self.offboard_required_confirmations {
-            ret.offboard_required_confirmations = confs;
+            ret.offboard_required_confirmations = block_delta(confs, "offboard_required_confirmations")?;
         }
         if let Some(manual) = self.daemon_manual_sync {
             ret.daemon_manual_sync = manual;
@@ -128,6 +128,12 @@ impl Config {
 
         Ok(ret)
     }
+}
+
+/// Bark counts confirmations in a `u16`; the FFI field stays a `u32`.
+fn block_delta(value: u32, field: &str) -> Result<bark_bitcoin_ext::BlockDelta, crate::error::Error> {
+    bark_bitcoin_ext::BlockDelta::try_from(value)
+        .map_err(|_| format!("{} {} is above the maximum of {}", field, value, u16::MAX).into())
 }
 
 #[cfg(test)]
@@ -182,5 +188,22 @@ mod tests {
         let err = config.into_bark(bitcoin::Network::Regtest)
             .expect_err("a gap limit above the maximum should be refused");
         assert!(err.message().contains("above the maximum"), "{}", err.message());
+    }
+
+    /// bark counts confirmations in a `u16`; the FFI field is a `u32`.
+    #[test]
+    fn confirmations_beyond_u16_are_refused() {
+        let mut config = minimal();
+        config.round_tx_required_confirmations = Some(u16::MAX as u32);
+        config.offboard_required_confirmations = Some(6);
+        let cfg = config.into_bark(bitcoin::Network::Regtest).unwrap();
+        assert_eq!(cfg.round_tx_required_confirmations.to_u16(), u16::MAX);
+        assert_eq!(cfg.offboard_required_confirmations.to_u16(), 6);
+
+        let mut config = minimal();
+        config.offboard_required_confirmations = Some(u16::MAX as u32 + 1);
+        let err = config.into_bark(bitcoin::Network::Regtest)
+            .expect_err("a confirmation count above u16::MAX should be refused");
+        assert!(err.message().contains("offboard_required_confirmations"), "{}", err.message());
     }
 }

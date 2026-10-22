@@ -13,7 +13,8 @@ use crate::core::onchain::OnchainWallet as CoreOnchainWallet;
 use crate::core::wallet::{seed_from_str, OpenArgs as CoreOpenArgs, Wallet as CoreWallet};
 use crate::error::Error;
 use crate::types::{
-    AddressWithIndex, ArkInfo, Balance, BoardFundingInfo, EmergencyExitFeeEstimate,
+    AddressWithIndex, ArkInfo, Balance, BalanceSummary, BoardFundingInfo, DebugInfo,
+    EmergencyExitFeeEstimate,
     ExitCancelResult, ExitClaimTransaction, ExitProgressStatus, ExitTransactionStatus, ExitVtxo,
     FeeEstimate, ImportVtxoArgs, LightningInvoice,
     LightningReceive, LightningSend, LightningSendStatus, Movement, Network, OffboardResult,
@@ -48,6 +49,10 @@ pub struct PayLightningInvoiceArgs {
     pub amountSats: Option<u64>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -58,6 +63,10 @@ pub struct PayLightningOfferArgs {
     pub amountSats: Option<u64>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -69,6 +78,10 @@ pub struct PayLightningAddressArgs {
     pub comment: Option<String>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -80,6 +93,10 @@ pub struct PayLnurlArgs {
     pub comment: Option<String>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -409,6 +426,13 @@ impl Wallet {
         Ok(self.core.balance().await?.into_ts()?)
     }
 
+    /// The numbers to show a user, without the breakdown of `balance`: what
+    /// they can spend, what needs a refresh, what is pending and the total.
+    #[wasm_bindgen(js_name = balanceSummary)]
+    pub async fn balance_summary(&self) -> Result<Ts<BalanceSummary>, JsError> {
+        Ok(self.core.balance_summary().await?.into_ts()?)
+    }
+
     pub async fn vtxos(&self) -> Result<Vec<Ts<Vtxo>>, JsError> {
         Ok(self.core.vtxos().await?.into_iter().map(|v| v.into_ts()).collect::<Result<Vec<_>, _>>()?)
     }
@@ -462,7 +486,10 @@ impl Wallet {
         args: Ts<PayLightningInvoiceArgs>,
     ) -> Result<Ts<LightningSendStatus>, JsError> {
         let args = args.to_rust()?;
-        Ok(self.core.pay_lightning_invoice(args.invoice, args.amountSats, args.wait.unwrap_or(false)).await?.into_ts()?)
+        Ok(self
+            .core
+            .pay_lightning_invoice(args.invoice, args.amountSats, args.wait.unwrap_or(false), args.retryForSecs)
+            .await?.into_ts()?)
     }
 
     #[wasm_bindgen(js_name = payLightningOffer)]
@@ -471,7 +498,10 @@ impl Wallet {
         args: Ts<PayLightningOfferArgs>,
     ) -> Result<Ts<LightningSendStatus>, JsError> {
         let args = args.to_rust()?;
-        Ok(self.core.pay_lightning_offer(args.offer, args.amountSats, args.wait.unwrap_or(false)).await?.into_ts()?)
+        Ok(self
+            .core
+            .pay_lightning_offer(args.offer, args.amountSats, args.wait.unwrap_or(false), args.retryForSecs)
+            .await?.into_ts()?)
     }
 
     /// Pay to a Lightning Address (`user@domain`), resolved via LNURL-pay.
@@ -492,6 +522,7 @@ impl Wallet {
                 args.amountSats,
                 args.comment,
                 args.wait.unwrap_or(false),
+                args.retryForSecs,
             )
             .await?.into_ts()?)
     }
@@ -510,6 +541,7 @@ impl Wallet {
                 args.amountSats,
                 args.comment,
                 args.wait.unwrap_or(false),
+                args.retryForSecs,
             )
             .await?.into_ts()?)
     }
@@ -643,12 +675,13 @@ impl Wallet {
 
     // -- Arkoor ---------------------------------------------------------------
 
+    /// Returns the id of the movement that records the payment.
     #[wasm_bindgen(js_name = sendArkoorPayment)]
     pub async fn send_arkoor_payment(
         &self,
         arkAddress: String,
         amountSats: f64,
-    ) -> Result<(), JsError> {
+    ) -> Result<u32, JsError> {
         Ok(self.core.send_arkoor_payment(arkAddress, amountSats as u64).await?)
     }
 
@@ -661,9 +694,11 @@ impl Wallet {
         Ok(self.core.validate_arkoor_address(address).await?)
     }
 
+    /// Send `amountSats` from the offchain balance to an onchain address, as
+    /// an offboard. Returns the offboard txid and its movement id.
     #[wasm_bindgen(js_name = sendOnchain)]
-    pub async fn send_onchain(&self, address: String, amountSats: f64) -> Result<String, JsError> {
-        Ok(self.core.send_onchain(address, amountSats as u64).await?)
+    pub async fn send_onchain(&self, address: String, amountSats: f64) -> Result<Ts<OffboardResult>, JsError> {
+        Ok(self.core.send_onchain(address, amountSats as u64).await?.into_ts()?)
     }
 
     // -- History --------------------------------------------------------------
@@ -998,6 +1033,13 @@ impl Wallet {
         Ok(self.core.mailbox_identifier()?)
     }
 
+    /// The network, mailbox id and VTXO xpub, as `bark debug-info` prints
+    /// them. Users can share this in support requests.
+    #[wasm_bindgen(js_name = debugInfo)]
+    pub async fn debug_info(&self) -> Result<Ts<DebugInfo>, JsError> {
+        Ok(self.core.debug_info().await?.into_ts()?)
+    }
+
     /// Create a hex-encoded authorization that lets whoever holds it read this
     /// wallet's mailbox from the Ark server for `expirySecs` from now, so 86400
     /// for 24 hours. An authorization cannot be revoked early, so keep the
@@ -1115,20 +1157,23 @@ impl Wallet {
     /// spendable VTXO). `feeRateSatPerVb` applies to both legs; omit it to use
     /// the chain's fast rate for the broadcast leg and regular rate for the
     /// claim leg. `destination` only affects the claim transaction's weight.
+    /// `feeMargin` scales the broadcast leg (finite and non-negative; default
+    /// 1.2).
     ///
-    /// The onchain wallet is synced first so `fundable` reflects the current
-    /// confirmed balance. Already-confirmed exit transactions cost nothing.
+    /// Already-confirmed exit transactions cost nothing. The estimate never
+    /// reads the onchain wallet, so it works before the wallet holds funds.
     #[wasm_bindgen(js_name = estimateEmergencyExitFee)]
     pub async fn estimate_emergency_exit_fee(
         &self,
         vtxoIds: Vec<String>,
         feeRateSatPerVb: Option<f64>,
         destination: Option<String>,
+        feeMargin: Option<f64>,
     ) -> Result<Ts<EmergencyExitFeeEstimate>, JsError> {
         let fee_rate = feeRateSatPerVb.map(fee_rate_sat_per_vb_from_js).transpose()?;
         Ok(self
             .core
-            .estimate_emergency_exit_fee(vtxoIds, fee_rate, destination)
+            .estimate_emergency_exit_fee(vtxoIds, fee_rate, destination, feeMargin)
             .await?.into_ts()?)
     }
 
