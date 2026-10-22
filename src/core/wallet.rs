@@ -591,6 +591,10 @@ impl Wallet {
 
     // ------------------------------------------------------------------------
     // Lightning (send)
+    //
+    // `retry_for_secs` is how long the Ark server keeps trying to pay, capped
+    // to the server's maximum; `None` leaves it to the server and 0 makes a
+    // single attempt.
     // ------------------------------------------------------------------------
 
     pub async fn pay_lightning_invoice(
@@ -598,12 +602,13 @@ impl Wallet {
         invoice: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let invoice: Invoice = invoice.parse().context("invalid invoice")?;
         let amount = amount_sats.map(bitcoin::Amount::from_sat);
         let resolved = self
             .inner
-            .pay_lightning_invoice(invoice, amount, wait)
+            .pay_lightning_invoice_with(invoice, amount, lightning_send_options(wait, retry_for_secs))
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -613,13 +618,14 @@ impl Wallet {
         offer: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let offer_obj = Offer::from_str(&offer)
             .map_err(|e| anyhow::anyhow!("invalid BOLT12 offer: {e:?}"))?;
         let amount = amount_sats.map(bitcoin::Amount::from_sat);
         let resolved = self
             .inner
-            .pay_lightning_offer(offer_obj, amount, wait)
+            .pay_lightning_offer_with(offer_obj, amount, lightning_send_options(wait, retry_for_secs))
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -637,6 +643,7 @@ impl Wallet {
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let addr: bark::lnurllib::lightning_address::LightningAddress = lightning_address
             .trim()
@@ -645,7 +652,9 @@ impl Wallet {
         let amount = bitcoin::Amount::from_sat(amount_sats);
         let resolved = self
             .inner
-            .pay_lightning_address(&addr, amount, comment.as_deref(), wait)
+            .pay_lightning_address_with(
+                &addr, amount, comment.as_deref(), lightning_send_options(wait, retry_for_secs),
+            )
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -662,13 +671,16 @@ impl Wallet {
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let lnurl: bark::lnurllib::lnurl::LnUrl =
             lnurl.trim().parse().context("invalid lnurl")?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
         let resolved = self
             .inner
-            .pay_lnurl(&lnurl, amount, comment.as_deref(), wait)
+            .pay_lnurl_with(
+                &lnurl, amount, comment.as_deref(), lightning_send_options(wait, retry_for_secs),
+            )
             .await?;
         self.lightning_send_status(resolved).await
     }
@@ -1961,6 +1973,13 @@ impl Wallet {
     }
 }
 
+/// bark's options for a lightning send.
+fn lightning_send_options(wait: bool, retry_for_secs: Option<u64>) -> bark::LightningSendOptions {
+    bark::LightningSendOptions::default()
+        .wait(wait)
+        .retry_for(retry_for_secs.map(std::time::Duration::from_secs))
+}
+
 /// Absolute expiry `expiry_secs` from now.
 fn mailbox_auth_expiry(expiry_secs: u32) -> Result<DateTime<Local>, Error> {
     Local::now()
@@ -2073,6 +2092,17 @@ mod tests {
         let vtxo = parse_vtxo(BOARD_VTXO_HEX).unwrap();
         let id_str = vtxo.id().to_string();
         assert_eq!(id_str.parse::<VtxoId>().unwrap(), vtxo.id());
+    }
+
+    #[test]
+    fn lightning_send_options_carry_wait_and_retry_for() {
+        let opts = lightning_send_options(true, Some(30));
+        assert!(opts.wait);
+        assert_eq!(opts.retry_for, Some(std::time::Duration::from_secs(30)));
+
+        let opts = lightning_send_options(false, None);
+        assert!(!opts.wait);
+        assert_eq!(opts.retry_for, None);
     }
 
     #[test]

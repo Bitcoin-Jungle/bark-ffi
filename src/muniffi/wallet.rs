@@ -295,29 +295,39 @@ impl Wallet {
     // Lightning (send)
     // ------------------------------------------------------------------------
 
-    #[uniffi::method(default(wait = false))]
+    /// Pay a BOLT11 invoice.
+    ///
+    /// `retry_for_secs` is how long the Ark server keeps trying to pay,
+    /// capped to the server's maximum; `None` leaves it to the server and 0
+    /// makes a single attempt. The same holds for every `pay_*` method.
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lightning_invoice(
         &self,
         invoice: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
-        run_async(async move { core.pay_lightning_invoice(invoice, amount_sats, wait).await }).await
+        run_async(async move {
+            core.pay_lightning_invoice(invoice, amount_sats, wait, retry_for_secs).await
+        })
+        .await
     }
 
     /// Pay to a Lightning Address (`user@domain`), resolved via LNURL-pay.
-    #[uniffi::method(default(wait = false))]
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lightning_address(
         &self,
         lightning_address: String,
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
         run_async(async move {
-            core.pay_lightning_address(lightning_address, amount_sats, comment, wait)
+            core.pay_lightning_address(lightning_address, amount_sats, comment, wait, retry_for_secs)
                 .await
         })
         .await
@@ -327,27 +337,35 @@ impl Wallet {
     ///
     /// Resolves the LNURL-pay endpoint to a BOLT11 invoice and pays it. Errors
     /// if the link decodes to a non-pay LNURL (auth, withdraw, channel).
-    #[uniffi::method(default(wait = false))]
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lnurl(
         &self,
         lnurl: String,
         amount_sats: u64,
         comment: Option<String>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
-        run_async(async move { core.pay_lnurl(lnurl, amount_sats, comment, wait).await }).await
+        run_async(async move {
+            core.pay_lnurl(lnurl, amount_sats, comment, wait, retry_for_secs).await
+        })
+        .await
     }
 
-    #[uniffi::method(default(wait = false))]
+    #[uniffi::method(default(wait = false, retry_for_secs = None))]
     pub async fn pay_lightning_offer(
         &self,
         offer: String,
         amount_sats: Option<u64>,
         wait: bool,
+        retry_for_secs: Option<u64>,
     ) -> Result<types::LightningSendStatus, Error> {
         let core = self.core.clone();
-        run_async(async move { core.pay_lightning_offer(offer, amount_sats, wait).await }).await
+        run_async(async move {
+            core.pay_lightning_offer(offer, amount_sats, wait, retry_for_secs).await
+        })
+        .await
     }
 
     #[uniffi::method(default(wait = false))]

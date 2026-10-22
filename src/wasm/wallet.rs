@@ -49,6 +49,10 @@ pub struct PayLightningInvoiceArgs {
     pub amountSats: Option<u64>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -59,6 +63,10 @@ pub struct PayLightningOfferArgs {
     pub amountSats: Option<u64>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -70,6 +78,10 @@ pub struct PayLightningAddressArgs {
     pub comment: Option<String>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -81,6 +93,10 @@ pub struct PayLnurlArgs {
     pub comment: Option<String>,
     #[tsify(optional)]
     pub wait: Option<bool>,
+    /// Seconds the Ark server keeps trying to pay, capped to the server's
+    /// maximum. Omit to leave it to the server; 0 makes a single attempt.
+    #[tsify(optional)]
+    pub retryForSecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -470,7 +486,10 @@ impl Wallet {
         args: Ts<PayLightningInvoiceArgs>,
     ) -> Result<Ts<LightningSendStatus>, JsError> {
         let args = args.to_rust()?;
-        Ok(self.core.pay_lightning_invoice(args.invoice, args.amountSats, args.wait.unwrap_or(false)).await?.into_ts()?)
+        Ok(self
+            .core
+            .pay_lightning_invoice(args.invoice, args.amountSats, args.wait.unwrap_or(false), args.retryForSecs)
+            .await?.into_ts()?)
     }
 
     #[wasm_bindgen(js_name = payLightningOffer)]
@@ -479,7 +498,10 @@ impl Wallet {
         args: Ts<PayLightningOfferArgs>,
     ) -> Result<Ts<LightningSendStatus>, JsError> {
         let args = args.to_rust()?;
-        Ok(self.core.pay_lightning_offer(args.offer, args.amountSats, args.wait.unwrap_or(false)).await?.into_ts()?)
+        Ok(self
+            .core
+            .pay_lightning_offer(args.offer, args.amountSats, args.wait.unwrap_or(false), args.retryForSecs)
+            .await?.into_ts()?)
     }
 
     /// Pay to a Lightning Address (`user@domain`), resolved via LNURL-pay.
@@ -500,6 +522,7 @@ impl Wallet {
                 args.amountSats,
                 args.comment,
                 args.wait.unwrap_or(false),
+                args.retryForSecs,
             )
             .await?.into_ts()?)
     }
@@ -518,6 +541,7 @@ impl Wallet {
                 args.amountSats,
                 args.comment,
                 args.wait.unwrap_or(false),
+                args.retryForSecs,
             )
             .await?.into_ts()?)
     }
