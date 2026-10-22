@@ -106,6 +106,22 @@ pub(crate) fn parse_vtxo_ids(vtxo_ids: &[String]) -> Result<Vec<VtxoId>, Error> 
         .collect()
 }
 
+/// Put an onchain address on a BIP 321 URI the way bark's own builder does:
+/// a mainnet address in the URI path, any other in a `tb=` parameter (the
+/// bip321 crate only allows mainnet addresses in the path).
+fn add_onchain_address(
+    uri: &mut bark::payment_request::BarkBip321Uri,
+    address: bitcoin::Address,
+    network: bitcoin::Network,
+) -> Result<(), Error> {
+    if network == bitcoin::Network::Bitcoin {
+        uri.set_address(address.into_unchecked()).context("failed to set onchain address")?;
+    } else {
+        uri.push_tb(address.into_unchecked(), false).context("failed to set onchain address")?;
+    }
+    Ok(())
+}
+
 /// Human-readable one-liner for a VTXO state, for error messages.
 fn describe_state(state: &types::VtxoState) -> String {
     match state {
@@ -955,6 +971,125 @@ impl Wallet {
         let addr = parse_address(&address, self.inner.network().await?)?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
         Ok(self.inner.send_onchain(addr, amount).await?.into())
+    }
+
+    // ------------------------------------------------------------------------
+    // Payment requests
+    // ------------------------------------------------------------------------
+
+    /// Parse any payment string bark understands: a BIP 321 `bitcoin:` URI, a
+    /// `lightning:` URI (any case), a BOLT11 invoice, a BOLT12 offer, a
+    /// lightning address, an LNURL-pay link or LUD-17 `lnurlp://` URI, an Ark
+    /// address, a bitcoin address or a hex output script. Surrounding
+    /// whitespace is not trimmed.
+    ///
+    /// Problems with a single option (wrong network, an Ark address of
+    /// another server, an amount mismatch) are reported in that option's
+    /// `errors`. Errors only when nothing in the string can be paid at all.
+    /// Checking an Ark address needs a server connection.
+    pub async fn parse_payment_request(
+        &self,
+        payment: String,
+    ) -> Result<types::PaymentRequest, Error> {
+        Ok(self.inner.parse_payment_request(&payment).await?.into())
+    }
+
+    /// Estimate the fee of paying `amount_sats` to `method`.
+    pub async fn estimate_payment_fee(
+        &self,
+        method: types::PaymentMethod,
+        amount_sats: u64,
+    ) -> Result<types::FeeEstimate, Error> {
+        let option = bark::AvailablePaymentMethod {
+            method: method.to_bark().context("invalid payment method")?,
+            errors: vec![],
+        };
+        let amount = bitcoin::Amount::from_sat(amount_sats);
+        Ok(self.inner.estimate_payment_fee(&option, amount).await?.into())
+    }
+
+    /// Pay `method` over the matching rail: Ark, lightning or onchain.
+    ///
+    /// `amount_sats` is required for addresses and LNURL, and for invoices
+    /// and offers without an amount. `comment` only reaches lightning
+    /// addresses and LNURL. `wait` and `retry_for_secs` only affect
+    /// lightning; `retry_for_secs` is as in the `pay_*` methods.
+    pub async fn send_payment(
+        &self,
+        method: types::PaymentMethod,
+        amount_sats: Option<u64>,
+        comment: Option<String>,
+        wait: bool,
+        retry_for_secs: Option<u64>,
+    ) -> Result<types::PaymentResult, Error> {
+        let method = method.to_bark().context("invalid payment method")?;
+        let amount = amount_sats.map(bitcoin::Amount::from_sat);
+        let opts = lightning_send_options(wait, retry_for_secs);
+        Ok(self.inner.send_payment_with(&method, amount, comment, opts).await?.into())
+    }
+
+    /// Build a BIP 321 `bitcoin:` URI with a new Ark address, a new BOLT11
+    /// invoice (when there is an amount) and the caller's onchain address,
+    /// as `options` selects.
+    pub async fn bip321_uri(
+        &self,
+        options: types::Bip321UriOptions,
+    ) -> Result<types::Bip321Uri, Error> {
+        let network = self.inner.network().await?;
+        // Checked before anything is derived, so a bad address doesn't use
+        // up an Ark address or register an invoice.
+        let onchain = options
+            .onchain_address
+            .as_deref()
+            .map(|a| parse_address(a, network))
+            .transpose()?;
+        let amount = options.amount_sats.map(bitcoin::Amount::from_sat);
+        let lightning = options.lightning && amount.is_some();
+
+        if !options.ark && !lightning && onchain.is_none() {
+            return Err(anyhow::anyhow!(
+                "the URI would have no destination: include ark, or lightning with an amount, \
+                 or pass an onchain address"
+            ).into());
+        }
+
+        let mut uri = if options.ark || lightning {
+            // The builder borrows the wallet mutably; `bark::Wallet` is an
+            // `Arc` handle, so a clone is the same wallet.
+            let mut wallet = self.inner.clone();
+            let mut builder = wallet.bip321_uri().ark(options.ark).lightning_bolt11(lightning);
+            if let Some(amount) = amount {
+                builder = builder.amount(amount);
+            }
+            if let Some(label) = options.label {
+                builder = builder.label(label);
+            }
+            if let Some(message) = options.message {
+                builder = builder.message(message);
+            }
+            builder.build().await?
+        } else {
+            // Not through the builder: it debug-asserts that the URI has a
+            // destination before the onchain address is added below.
+            let mut uri = bark::payment_request::BarkBip321Uri::new();
+            if let Some(amount) = amount {
+                uri.set_amount(amount).context("invalid amount")?;
+            }
+            if let Some(label) = options.label {
+                uri.set_label(label);
+            }
+            if let Some(message) = options.message {
+                uri.set_message(message);
+            }
+            uri
+        };
+
+        if let Some(address) = onchain {
+            add_onchain_address(&mut uri, address, network)?;
+        }
+        uri.validate().context("invalid BIP 321 URI")?;
+
+        Ok((&uri).into())
     }
 
     // ------------------------------------------------------------------------
@@ -2290,5 +2425,300 @@ mod tests {
     fn parse_vtxo_rejects_truncated() {
         let truncated = &BOARD_VTXO_HEX[..BOARD_VTXO_HEX.len() - 8];
         assert!(parse_vtxo(truncated).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Payment requests
+    // ------------------------------------------------------------------
+
+    const MAINNET_ADDRESS: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const REGTEST_ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    #[test]
+    fn an_onchain_address_goes_where_barks_builder_puts_it() {
+        use bark::payment_request::BarkBip321Uri;
+
+        let mut uri = BarkBip321Uri::new();
+        let address = parse_address(MAINNET_ADDRESS, bitcoin::Network::Bitcoin).unwrap();
+        add_onchain_address(&mut uri, address, bitcoin::Network::Bitcoin).unwrap();
+        assert_eq!(uri.to_string(), format!("bitcoin:{}", MAINNET_ADDRESS));
+
+        let mut uri = BarkBip321Uri::new();
+        let address = parse_address(REGTEST_ADDRESS, bitcoin::Network::Regtest).unwrap();
+        add_onchain_address(&mut uri, address, bitcoin::Network::Regtest).unwrap();
+        assert_eq!(uri.to_string(), format!("bitcoin:?tb={}", REGTEST_ADDRESS));
+    }
+
+    /// A stand-in Esplora that only answers the genesis-block check bark makes
+    /// when opening a wallet. Returns its base URL.
+    #[cfg(feature = "uniffi")]
+    fn stub_esplora() -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .block_hash()
+            .to_string();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let (status, body) = if buf[..n].starts_with(b"GET /block-height/0 ") {
+                    ("200 OK", genesis.as_str())
+                } else {
+                    ("404 Not Found", "")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    status, body.len(), body,
+                );
+            }
+        });
+        url
+    }
+
+    /// A directory removed on drop, also when the test panics.
+    #[cfg(feature = "uniffi")]
+    struct TempDatadir(std::path::PathBuf);
+
+    #[cfg(feature = "uniffi")]
+    impl Drop for TempDatadir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A regtest wallet opened without a reachable Ark server, in a fresh
+    /// datadir. Fields drop in order, so the wallet closes before its
+    /// datadir goes.
+    #[cfg(feature = "uniffi")]
+    struct OfflineWallet {
+        wallet: Wallet,
+        _datadir: TempDatadir,
+    }
+
+    #[cfg(feature = "uniffi")]
+    impl OfflineWallet {
+        async fn open(name: &str) -> Self {
+            let datadir = TempDatadir(
+                std::env::temp_dir()
+                    .join(format!("bark-ffi-test-{}-{}", name, std::process::id())),
+            );
+            let _ = std::fs::remove_dir_all(&datadir.0);
+            let datadir_str = datadir.0.to_str().unwrap().to_owned();
+
+            let mut config = minimal_config();
+            // Nothing listens on port 1, so every Ark server call fails fast.
+            config.server_address = "http://127.0.0.1:1".to_owned();
+            config.esplora_address = Some(stub_esplora());
+
+            let wallet = Wallet::open(
+                Network::Regtest,
+                "abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon about".to_owned(),
+                config,
+                OpenArgs {
+                    run_daemon: false,
+                    persister: Some(crate::muniffi::db::open_sqlite_db(&datadir_str).unwrap()),
+                    datadir: Some(datadir_str),
+                    lock_manager: None,
+                    onchain: None,
+                    create_if_not_exists: true,
+                    create_without_server: true,
+                    skip_recovery: true,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("offline wallet did not open: {}", e.message()));
+            Self { wallet, _datadir: datadir }
+        }
+    }
+
+    /// A URI this wallet builds parses back to what went in. Only the onchain
+    /// destination works without a server; Ark and lightning are covered by
+    /// [`parse_payment_request_reads_a_bip321_uri_with_every_rail`].
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn bip321_uri_roundtrips_through_parse_payment_request() {
+        let w = OfflineWallet::open("bip321-roundtrip").await;
+
+        let built = w.wallet.bip321_uri(types::Bip321UriOptions {
+            amount_sats: Some(50_000),
+            label: Some("Coffee & cake".to_owned()),
+            message: Some("thanks!".to_owned()),
+            ark: false,
+            lightning: false,
+            onchain_address: Some(REGTEST_ADDRESS.to_owned()),
+        }).await.unwrap();
+        assert_eq!(built.onchain_address.as_deref(), Some(REGTEST_ADDRESS));
+        assert_eq!(built.ark_address, None);
+        assert!(built.lightning_invoice.is_none());
+        assert!(built.uri.contains(&format!("tb={}", REGTEST_ADDRESS)), "{}", built.uri);
+
+        let parsed = w.wallet.parse_payment_request(built.uri).await.unwrap();
+        assert_eq!(parsed.amount_sats, Some(50_000));
+        assert_eq!(parsed.label.as_deref(), Some("Coffee & cake"));
+        assert_eq!(parsed.message.as_deref(), Some("thanks!"));
+        assert_eq!(parsed.options.len(), 1);
+        let option = &parsed.options[0];
+        assert_eq!(option.method, types::PaymentMethod::Bitcoin { value: REGTEST_ADDRESS.to_owned() });
+        assert!(option.errors.is_empty(), "{:?}", option.errors);
+        assert_eq!(parsed.default_option.as_ref(), Some(option));
+    }
+
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn bip321_uri_refuses_bad_options_before_deriving_anything() {
+        let w = OfflineWallet::open("bip321-refuse").await;
+        let options = |ark, lightning, amount_sats, onchain: Option<&str>| types::Bip321UriOptions {
+            amount_sats,
+            label: None,
+            message: None,
+            ark,
+            lightning,
+            onchain_address: onchain.map(str::to_owned),
+        };
+
+        // Nothing to pay to: lightning without an amount adds nothing.
+        let err = w.wallet.bip321_uri(options(false, true, None, None)).await.unwrap_err();
+        assert!(err.message().contains("no destination"), "{}", err.message());
+
+        // A mainnet address in a regtest wallet's URI.
+        let err = w.wallet
+            .bip321_uri(options(true, true, None, Some(MAINNET_ADDRESS)))
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("not valid on"), "{}", err.message());
+
+        let err = w.wallet
+            .bip321_uri(options(false, false, Some(0), Some(REGTEST_ADDRESS)))
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("invalid amount"), "{}", err.message());
+    }
+
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn parse_payment_request_recognizes_each_kind() {
+        use types::{PaymentMethod as M, PaymentMethodParsingError as E};
+
+        let w = OfflineWallet::open("parse-kinds").await;
+        let parse = |s: &str| {
+            let wallet = w.wallet.clone();
+            let s = s.to_owned();
+            async move { wallet.parse_payment_request(s).await }
+        };
+
+        let req = parse(REGTEST_ADDRESS).await.unwrap();
+        assert_eq!(req.options[0].method, M::Bitcoin { value: REGTEST_ADDRESS.to_owned() });
+        assert!(req.options[0].errors.is_empty());
+
+        let req = parse(MAINNET_ADDRESS).await.unwrap();
+        assert_eq!(req.options[0].errors, vec![E::NetworkMismatch]);
+        assert_eq!(req.default_option, None);
+
+        let invoice = test_invoice(Some(21_000_000), "coffee");
+        for input in [invoice.clone(), format!("lightning:{}", invoice), format!("LIGHTNING:{}", invoice)] {
+            let req = parse(&input).await.unwrap();
+            assert_eq!(req.amount_sats, Some(21_000), "{}", input);
+            assert_eq!(req.message.as_deref(), Some("coffee"));
+            let option = &req.options[0];
+            assert_eq!(option.method, M::Invoice { value: invoice.clone() });
+            assert!(option.errors.is_empty(), "{:?}", option.errors);
+            assert!(!option.requires_amount);
+        }
+
+        let req = parse("byte@second.tech").await.unwrap();
+        assert_eq!(req.options[0].method, M::LightningAddress { value: "byte@second.tech".to_owned() });
+        assert!(req.options[0].requires_amount);
+
+        for input in [LNURL, "lnurlp://example.com/pay"] {
+            let req = parse(input).await.unwrap();
+            assert!(matches!(req.options[0].method, M::Lnurl { .. }), "{:?}", req.options[0].method);
+        }
+
+        let req = parse(OFFER).await.unwrap();
+        assert!(matches!(req.options[0].method, M::Offer { .. }), "{:?}", req.options[0].method);
+
+        // Checking an Ark address needs the server, so offline it is listed
+        // with an error rather than dropped.
+        let req = parse(ARK).await.unwrap();
+        assert_eq!(req.options[0].method, M::Ark { value: ARK.to_owned() });
+        assert!(
+            matches!(req.options[0].errors[..], [E::InvalidArkAddress { .. }]),
+            "{:?}", req.options[0].errors,
+        );
+
+        let req = parse("6a0474657374").await.unwrap();
+        assert_eq!(req.options[0].method, M::OutputScript { value: "6a0474657374".to_owned() });
+        assert_eq!(req.options[0].errors, vec![E::Unsupported]);
+
+        assert!(parse("not a payment request").await.is_err());
+    }
+
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn parse_payment_request_reads_a_bip321_uri_with_every_rail() {
+        use types::{PaymentMethod as M, PaymentMethodParsingError as E};
+
+        let w = OfflineWallet::open("parse-bip321").await;
+        // The invoice asks for 50k sats but the URI for 100k.
+        let invoice = test_invoice(Some(50_000_000), "");
+        let uri = format!(
+            "bitcoin:?amount=0.001&label=shop&lightning={}&tb={}&ark={}",
+            invoice, REGTEST_ADDRESS, ARK,
+        );
+
+        let req = w.wallet.parse_payment_request(uri).await.unwrap();
+        assert_eq!(req.amount_sats, Some(100_000));
+        assert_eq!(req.label.as_deref(), Some("shop"));
+
+        let option = |m: &M| req.options.iter().find(|o| &o.method == m).unwrap();
+        assert!(option(&M::Bitcoin { value: REGTEST_ADDRESS.to_owned() }).errors.is_empty());
+        assert_eq!(
+            option(&M::Invoice { value: invoice.clone() }).errors,
+            vec![E::AmountMismatch { expected_sats: 50_000, got_sats: 100_000 }],
+        );
+        assert!(!option(&M::Ark { value: ARK.to_owned() }).errors.is_empty());
+        assert_eq!(req.options.len(), 3);
+        // Ark and lightning both have errors, so onchain is the default.
+        assert_eq!(
+            req.default_option.map(|o| o.method),
+            Some(M::Bitcoin { value: REGTEST_ADDRESS.to_owned() }),
+        );
+    }
+
+    #[cfg(feature = "uniffi")]
+    const ARK: &str = "tark1pwh9vsmezqqpjy9akejayl2vvcse6he97rn40g84xrlvrlnhayuuyefrp9nse2y3zqqpjy9akejayl2vvcse6he97rn40g84xrlvrlnhayuuyefrp9nse2yscufs5u";
+    #[cfg(feature = "uniffi")]
+    const OFFER: &str = "lno1qgsyxjtl6luzd9t3pr62xr7eemp6awnejusgf6gw45q75vcfqqqqqqq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
+    #[cfg(feature = "uniffi")]
+    const LNURL: &str = "LNURL1DP68GURN8GHJ7UM9WFMXJCM99E3K7MF0V9CXJ0M385EKVCENXC6R2C35XVUKXEFCV5MKVV34X5EKZD3EV56NYD3HXQURZEPEXEJXXEPNXSCRVWFNV9NXZCN9XQ6XYEFHVGCXXCMYXYMNSERXFQ5FNS";
+
+    /// A signed regtest BOLT11 invoice, as a string.
+    #[cfg(feature = "uniffi")]
+    fn test_invoice(amount_msat: Option<u64>, description: &str) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[2; 32]).unwrap();
+        let builder = InvoiceBuilder::new(Currency::Regtest)
+            .description(description.into())
+            .payment_hash(sha256::Hash::hash(b"preimage"))
+            .payment_secret(PaymentSecret([42; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144);
+        let builder = match amount_msat {
+            Some(msat) => builder.amount_milli_satoshis(msat),
+            None => builder,
+        };
+        builder
+            .build_signed(|hash: &Message| secp.sign_ecdsa_recoverable(hash, &secret))
+            .unwrap()
+            .to_string()
     }
 }

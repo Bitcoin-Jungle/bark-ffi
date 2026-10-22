@@ -1988,6 +1988,377 @@ pub struct CpfpParams {
 }
 
 // ============================================================================
+// Payment requests
+// ============================================================================
+
+/// A payment destination, mirroring `bark::movement::PaymentMethod`.
+///
+/// Each variant carries the destination as a string. `type` and `value`
+/// match upstream's JSON encoding (`{"type":"ark","value":"tark1…"}`), which
+/// is what `Movement.sent_to_addresses` and `Movement.received_on_addresses`
+/// hold and what `Wallet::history_by_payment_method` takes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PaymentMethod {
+    /// An Ark address.
+    Ark { value: String },
+    /// An onchain bitcoin address.
+    Bitcoin { value: String },
+    /// A hex-encoded onchain output script. bark cannot pay these yet.
+    OutputScript { value: String },
+    /// A lightning invoice, BOLT11 or BOLT12. `decode_bolt11_invoice` reads
+    /// a BOLT11 invoice's amount, description, payee and expiry.
+    Invoice { value: String },
+    /// A reusable BOLT12 offer.
+    Offer { value: String },
+    /// A lightning address (`user@domain`), resolved over LNURL-pay.
+    LightningAddress { value: String },
+    /// An LNURL-pay link (`lnurl1…`).
+    Lnurl { value: String },
+    /// A destination bark recognizes but cannot pay, such as an Arkade
+    /// address.
+    Custom { value: String },
+}
+
+impl PaymentMethod {
+    /// Upstream's type tag and value string.
+    fn type_value(&self) -> (&'static str, &str) {
+        match self {
+            Self::Ark { value } => ("ark", value),
+            Self::Bitcoin { value } => ("bitcoin", value),
+            Self::OutputScript { value } => ("output-script", value),
+            Self::Invoice { value } => ("invoice", value),
+            Self::Offer { value } => ("offer", value),
+            Self::LightningAddress { value } => ("lightning-address", value),
+            Self::Lnurl { value } => ("lnurl", value),
+            Self::Custom { value } => ("custom", value),
+        }
+    }
+
+    /// Parse back into bark's type. Fails if `value` is not a valid
+    /// destination of its kind.
+    pub(crate) fn to_bark(&self) -> anyhow::Result<bark::movement::PaymentMethod> {
+        let (type_str, value) = self.type_value();
+        bark::movement::PaymentMethod::from_type_value(type_str, value)
+    }
+}
+
+impl From<&bark::movement::PaymentMethod> for PaymentMethod {
+    fn from(m: &bark::movement::PaymentMethod) -> Self {
+        use bark::movement::PaymentMethod as B;
+
+        let value = m.value_string();
+        match m {
+            B::Ark(_) => Self::Ark { value },
+            B::Bitcoin(_) => Self::Bitcoin { value },
+            B::OutputScript(_) => Self::OutputScript { value },
+            B::Invoice(_) => Self::Invoice { value },
+            B::Offer(_) => Self::Offer { value },
+            B::LightningAddress(_) => Self::LightningAddress { value },
+            B::Lnurl(_) => Self::Lnurl { value },
+            B::Custom(_) => Self::Custom { value },
+        }
+    }
+}
+
+/// Why an option of a [`PaymentRequest`] may not be payable, mirroring
+/// `bark::PaymentMethodParsingError`.
+///
+/// Returned as data in [`AvailablePaymentMethod::errors`] rather than as an
+/// error, so the caller can still show every option and flag the bad ones.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PaymentMethodParsingError {
+    /// The destination is for another bitcoin network than the wallet's.
+    NetworkMismatch,
+    /// This wallet cannot pay the Ark address, for example because it
+    /// belongs to another Ark server. `reason` says which check failed.
+    InvalidArkAddress { reason: String },
+    /// The invoice or offer asks for `expected_sats`, but the URI's `amount`
+    /// is `got_sats`.
+    AmountMismatch { expected_sats: u64, got_sats: u64 },
+    /// The destination's amount is invalid.
+    InvalidAmount,
+    /// bark recognizes the destination but cannot pay it.
+    Unsupported,
+}
+
+impl From<&bark::PaymentMethodParsingError> for PaymentMethodParsingError {
+    fn from(e: &bark::PaymentMethodParsingError) -> Self {
+        use bark::PaymentMethodParsingError as B;
+        match e {
+            B::NetworkMismatch => Self::NetworkMismatch,
+            B::InvalidArkAddress(e) => Self::InvalidArkAddress { reason: e.to_string() },
+            B::AmountMismatch { expected, got } => Self::AmountMismatch {
+                expected_sats: expected.to_sat(),
+                got_sats: got.to_sat(),
+            },
+            B::InvalidAmount => Self::InvalidAmount,
+            B::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+/// Fields of a BOLT11 invoice, as returned by `decode_bolt11_invoice`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct Bolt11InvoiceDetails {
+    pub payment_hash: String,
+    /// `None` for an amountless invoice, which needs an amount to pay.
+    pub amount_msat: Option<u64>,
+    /// `amount_msat` rounded up to whole sats.
+    pub amount_sats: Option<u64>,
+    /// The description, when the invoice carries it directly.
+    pub description: Option<String>,
+    /// The hex SHA-256 of the description, when the invoice carries that
+    /// instead.
+    pub description_hash: Option<String>,
+    /// The payee's node public key, hex.
+    pub payee_pubkey: String,
+    /// Creation time, in unix seconds.
+    pub created_at: u64,
+    /// Expiry time, in unix seconds. Compare it with the current time to
+    /// tell whether the invoice can still be paid.
+    pub expires_at: u64,
+}
+
+impl From<&ark::lightning::Bolt11Invoice> for Bolt11InvoiceDetails {
+    fn from(invoice: &ark::lightning::Bolt11Invoice) -> Self {
+        use lightning_invoice::Bolt11InvoiceDescriptionRef as Description;
+
+        let (description, description_hash) = match invoice.description() {
+            Description::Direct(d) => (Some(d.to_string()), None),
+            Description::Hash(h) => (None, Some(h.0.to_string())),
+        };
+        let amount_msat = invoice.amount_milli_satoshis();
+        let created_at = invoice.duration_since_epoch().as_secs();
+
+        Self {
+            payment_hash: ark::lightning::PaymentHash::from(invoice).to_string(),
+            amount_msat,
+            amount_sats: amount_msat.map(|m| bitcoin::Amount::from_msat_ceil(m).to_sat()),
+            description,
+            description_hash,
+            payee_pubkey: invoice.get_payee_pub_key().to_string(),
+            created_at,
+            expires_at: created_at.saturating_add(invoice.expiry_time().as_secs()),
+        }
+    }
+}
+
+/// One way to pay a [`PaymentRequest`], mirroring
+/// `bark::AvailablePaymentMethod`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct AvailablePaymentMethod {
+    pub method: PaymentMethod,
+    /// Why this option may not be payable. Empty when bark found no problem.
+    pub errors: Vec<PaymentMethodParsingError>,
+    /// Whether `Wallet::send_payment` needs an amount for this method: always
+    /// for addresses and LNURL, and for invoices and offers that carry none.
+    pub requires_amount: bool,
+}
+
+impl From<&bark::AvailablePaymentMethod> for AvailablePaymentMethod {
+    fn from(o: &bark::AvailablePaymentMethod) -> Self {
+        Self {
+            method: (&o.method).into(),
+            errors: o.errors.iter().map(Into::into).collect(),
+            requires_amount: o.method.requires_amount(),
+        }
+    }
+}
+
+/// A parsed payment string, mirroring `bark::PaymentRequest`.
+///
+/// `label` and `message` come from a BIP 321 URI. For a bare BOLT11 invoice
+/// or BOLT12 offer, `amount_sats` is its amount and `message` its
+/// description.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PaymentRequest {
+    pub amount_sats: Option<u64>,
+    pub label: Option<String>,
+    pub message: Option<String>,
+    /// Every destination found, in the order bark parsed them.
+    pub options: Vec<AvailablePaymentMethod>,
+    /// The option to pay when the user doesn't pick one: Ark, then
+    /// lightning, then onchain, skipping options with errors. `None` when
+    /// every option has errors.
+    pub default_option: Option<AvailablePaymentMethod>,
+}
+
+impl From<bark::PaymentRequest> for PaymentRequest {
+    fn from(r: bark::PaymentRequest) -> Self {
+        let default_option = r.default_option().map(Into::into);
+        Self {
+            amount_sats: r.amount.map(|a| a.to_sat()),
+            options: r.options.iter().map(Into::into).collect(),
+            label: r.label,
+            message: r.message,
+            default_option,
+        }
+    }
+}
+
+/// Outcome of `Wallet::send_payment`, mirroring `bark::PaymentInitOutput`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PaymentResult {
+    /// The onchain payment's transaction was broadcast.
+    Onchain { txid: String },
+    /// The lightning payment was started. Unless `wait` was set it may still
+    /// be in flight: follow it with `lightning_send_state(payment_hash)`.
+    /// `invoice` is the one paid, which for an offer, lightning address or
+    /// LNURL is the one bark fetched.
+    Lightning { invoice: String, payment_hash: String },
+    /// The Ark payment was made. `movement_id` is the movement that records
+    /// it.
+    Ark { movement_id: u32 },
+}
+
+impl From<bark::PaymentInitOutput> for PaymentResult {
+    fn from(o: bark::PaymentInitOutput) -> Self {
+        match o {
+            bark::PaymentInitOutput::Onchain(txid) => Self::Onchain { txid: txid.to_string() },
+            bark::PaymentInitOutput::Lightning(invoice) => Self::Lightning {
+                payment_hash: invoice.payment_hash().to_string(),
+                invoice: invoice.to_string(),
+            },
+            bark::PaymentInitOutput::Ark(movement_id) => Self::Ark { movement_id: movement_id.0 },
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// What `Wallet::bip321_uri` puts in the URI. Every field is optional.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct Bip321UriOptions {
+    /// The amount to request. A lightning invoice needs one.
+    ///
+    /// Default: none
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    pub amount_sats: Option<u64>,
+
+    /// Default: none
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    pub label: Option<String>,
+
+    /// Default: none
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    pub message: Option<String>,
+
+    /// Whether to include a new Ark address.
+    ///
+    /// Default: true
+    #[cfg_attr(feature = "uniffi", uniffi(default = true))]
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    #[serde(default = "default_true")]
+    pub ark: bool,
+
+    /// Whether to include a new BOLT11 invoice. Ignored without
+    /// `amount_sats`.
+    ///
+    /// Default: true
+    #[cfg_attr(feature = "uniffi", uniffi(default = true))]
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    #[serde(default = "default_true")]
+    pub lightning: bool,
+
+    /// An onchain address to include, such as one from the host's own
+    /// onchain wallet. It must be for the wallet's network. As in bark's own
+    /// builder, a mainnet address goes in the URI path and any other in a
+    /// `tb=` parameter.
+    ///
+    /// Default: none
+    #[cfg_attr(feature = "uniffi", uniffi(default = None))]
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    pub onchain_address: Option<String>,
+}
+
+/// A BIP 321 URI built by `Wallet::bip321_uri`, with the destinations in it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct Bip321Uri {
+    /// The `bitcoin:` URI, for example to show as a QR code.
+    pub uri: String,
+    /// The new Ark address in the URI.
+    pub ark_address: Option<String>,
+    /// The new invoice in the URI. Follow the receive by its `payment_hash`.
+    pub lightning_invoice: Option<LightningInvoice>,
+    /// The onchain address in the URI.
+    pub onchain_address: Option<String>,
+}
+
+impl From<&bark::payment_request::BarkBip321Uri> for Bip321Uri {
+    fn from(uri: &bark::payment_request::BarkBip321Uri) -> Self {
+        let onchain_address = uri.address().cloned()
+            .or_else(|| uri.tb().first().map(|f| f.inner().clone()));
+        Self {
+            uri: uri.to_string(),
+            ark_address: uri.extensions().ark().first().map(|f| f.inner().to_string()),
+            lightning_invoice: uri.lightning().first().map(|f| {
+                let invoice = f.inner();
+                LightningInvoice {
+                    invoice: invoice.to_string(),
+                    payment_hash: ark::lightning::PaymentHash::from(invoice).to_string(),
+                    amount_sats: invoice.amount_milli_satoshis()
+                        .map_or(0, |m| bitcoin::Amount::from_msat_ceil(m).to_sat()),
+                }
+            }),
+            onchain_address: onchain_address.map(|a| a.to_string()),
+        }
+    }
+}
+
+// ============================================================================
 // WalletNotification
 // ============================================================================
 
@@ -2575,5 +2946,259 @@ mod tests {
         for level in log::Level::iter() {
             assert_eq!(log::LevelFilter::from(LogLevel::from(level)), level.to_level_filter());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Payment requests
+    // ------------------------------------------------------------------
+
+    /// Destinations from bark's own `PaymentMethod` tests.
+    const ARK: &str = "tark1pwh9vsmezqqpjy9akejayl2vvcse6he97rn40g84xrlvrlnhayuuyefrp9nse2y3zqqpjy9akejayl2vvcse6he97rn40g84xrlvrlnhayuuyefrp9nse2yscufs5u";
+    const SIGNET_INVOICE: &str = "lntbs100u1p5j0x82sp5d0rwfh7tgrrlwsegy9rx3tzpt36cqwjqza5x4wvcjxjzscfaf6jspp5d8q7354dg3p8h0kywhqq5dq984r8f5en98hf9ln85ug0w8fx6hhsdqqcqzpc9qyysgqyk54v7tpzprxll7e0jyvtxcpgwttzk84wqsfjsqvcdtq47zt2wssxsmtjhz8dka62mdnf9jafhu3l4cpyfnsx449v4wstrwzzql2w5qqs8uh7p";
+    const OFFER: &str = "lno1qgsyxjtl6luzd9t3pr62xr7eemp6awnejusgf6gw45q75vcfqqqqqqq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
+    const LNURL: &str = "LNURL1DP68GURN8GHJ7UM9WFMXJCM99E3K7MF0V9CXJ0M385EKVCENXC6R2C35XVUKXEFCV5MKVV34X5EKZD3EV56NYD3HXQURZEPEXEJXXEPNXSCRVWFNV9NXZCN9XQ6XYEFHVGCXXCMYXYMNSERXFQ5FNS";
+    const REGTEST_ADDRESS: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    fn every_payment_method() -> Vec<bark::movement::PaymentMethod> {
+        [
+            ("ark", ARK),
+            ("bitcoin", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"),
+            ("output-script", "6a0474657374"),
+            ("invoice", SIGNET_INVOICE),
+            ("offer", OFFER),
+            ("lightning-address", "byte@second.tech"),
+            ("lnurl", LNURL),
+            ("custom", "an arkade address"),
+        ]
+        .iter()
+        .map(|(t, v)| bark::movement::PaymentMethod::from_type_value(t, v).unwrap())
+        .collect()
+    }
+
+    const PAYEE_SECRET: [u8; 32] = [2; 32];
+
+    /// A signed regtest invoice, created at 1_700_000_000.
+    fn regtest_invoice(
+        amount_msat: Option<u64>,
+        description: Result<&str, bitcoin::hashes::sha256::Hash>,
+        expiry_secs: Option<u64>,
+    ) -> ark::lightning::Bolt11Invoice {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&PAYEE_SECRET).unwrap();
+        let builder = InvoiceBuilder::new(Currency::Regtest);
+        let builder = match description {
+            Ok(d) => builder.description(d.into()),
+            Err(hash) => builder.description_hash(hash),
+        };
+        let mut builder = builder
+            .payment_hash(sha256::Hash::hash(b"preimage"))
+            .payment_secret(PaymentSecret([42; 32]))
+            .duration_since_epoch(std::time::Duration::from_secs(1_700_000_000))
+            .min_final_cltv_expiry_delta(144);
+        if let Some(secs) = expiry_secs {
+            builder = builder.expiry_time(std::time::Duration::from_secs(secs));
+        }
+        let builder = match amount_msat {
+            Some(msat) => builder.amount_milli_satoshis(msat),
+            None => builder,
+        };
+        builder
+            .build_signed(|hash: &Message| secp.sign_ecdsa_recoverable(hash, &secret))
+            .unwrap()
+    }
+
+    #[test]
+    fn payment_method_roundtrips_every_kind() {
+        for upstream in every_payment_method() {
+            let method = PaymentMethod::from(&upstream);
+            assert_eq!(method.to_bark().unwrap(), upstream);
+            // The same JSON as upstream's, which `Movement.sent_to_addresses`
+            // already holds, so TS callers can use one for the other.
+            assert_eq!(
+                serde_json::to_value(&method).unwrap(),
+                serde_json::to_value(&upstream).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_payment_method_that_does_not_parse_is_refused() {
+        assert!(PaymentMethod::Ark { value: "tark1nope".into() }.to_bark().is_err());
+        assert!(PaymentMethod::Invoice { value: "byte@second.tech".into() }.to_bark().is_err());
+        assert!(PaymentMethod::Bitcoin { value: ARK.into() }.to_bark().is_err());
+    }
+
+    #[test]
+    fn parsing_errors_keep_their_data() {
+        use bark::PaymentMethodParsingError as B;
+
+        let mismatch = PaymentMethodParsingError::from(&B::AmountMismatch {
+            expected: bitcoin::Amount::from_sat(1_000),
+            got: bitcoin::Amount::from_sat(2_000),
+        });
+        assert_eq!(
+            mismatch,
+            PaymentMethodParsingError::AmountMismatch { expected_sats: 1_000, got_sats: 2_000 },
+        );
+        assert_eq!(
+            serde_json::to_value(&mismatch).unwrap(),
+            serde_json::json!({ "type": "amount-mismatch", "expectedSats": 1000, "gotSats": 2000 }),
+        );
+
+        let server = B::InvalidArkAddress(bark::ArkoorAddressError::ServerMismatch);
+        assert_eq!(
+            PaymentMethodParsingError::from(&server),
+            PaymentMethodParsingError::InvalidArkAddress {
+                reason: bark::ArkoorAddressError::ServerMismatch.to_string(),
+            },
+        );
+        assert_eq!(
+            PaymentMethodParsingError::from(&B::NetworkMismatch),
+            PaymentMethodParsingError::NetworkMismatch,
+        );
+        assert_eq!(
+            PaymentMethodParsingError::from(&B::Unsupported),
+            PaymentMethodParsingError::Unsupported,
+        );
+    }
+
+    #[test]
+    fn bolt11_details_are_read_from_the_invoice() {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+        let payee = PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_slice(&PAYEE_SECRET).unwrap(),
+        );
+
+        let invoice = regtest_invoice(Some(100_000_001), Ok("coffee"), Some(600));
+        let details = Bolt11InvoiceDetails::from(&invoice);
+        assert_eq!(details.payment_hash, sha256::Hash::hash(b"preimage").to_string());
+        assert_eq!(details.amount_msat, Some(100_000_001));
+        assert_eq!(details.amount_sats, Some(100_001), "rounded up");
+        assert_eq!(details.description.as_deref(), Some("coffee"));
+        assert_eq!(details.description_hash, None);
+        assert_eq!(details.payee_pubkey, payee.to_string());
+        assert_eq!(details.created_at, 1_700_000_000);
+        assert_eq!(details.expires_at, 1_700_000_600);
+
+        // Amountless, with a hashed description and the default expiry.
+        let hash = sha256::Hash::hash(b"a long description");
+        let details = Bolt11InvoiceDetails::from(&regtest_invoice(None, Err(hash), None));
+        assert_eq!(details.amount_msat, None);
+        assert_eq!(details.amount_sats, None);
+        assert_eq!(details.description, None);
+        assert_eq!(details.description_hash, Some(hash.to_string()));
+        assert_eq!(details.expires_at, 1_700_000_000 + 3_600);
+    }
+
+    #[test]
+    fn an_option_says_whether_it_needs_an_amount() {
+        let option = |method: bark::movement::PaymentMethod| {
+            AvailablePaymentMethod::from(&bark::AvailablePaymentMethod { method, errors: vec![] })
+        };
+
+        assert!(option(regtest_invoice(None, Ok(""), None).into()).requires_amount);
+        assert!(!option(regtest_invoice(Some(5_000_000), Ok(""), None).into()).requires_amount);
+        assert!(option(
+            bark::movement::PaymentMethod::from_type_value("bitcoin", REGTEST_ADDRESS).unwrap(),
+        ).requires_amount);
+    }
+
+    #[test]
+    fn a_payment_request_names_its_default_option() {
+        let methods = every_payment_method();
+        let pick = |kind: &str| {
+            methods.iter().find(|m| m.type_str() == kind).unwrap().clone()
+        };
+        let request = bark::PaymentRequest {
+            amount: Some(bitcoin::Amount::from_sat(10_000)),
+            label: Some("label".into()),
+            message: Some("message".into()),
+            options: vec![
+                bark::AvailablePaymentMethod { method: pick("bitcoin"), errors: vec![] },
+                bark::AvailablePaymentMethod {
+                    method: pick("ark"),
+                    errors: vec![bark::PaymentMethodParsingError::NetworkMismatch],
+                },
+                bark::AvailablePaymentMethod { method: pick("invoice"), errors: vec![] },
+            ],
+        };
+
+        let request = PaymentRequest::from(request);
+        assert_eq!(request.amount_sats, Some(10_000));
+        assert_eq!(request.label.as_deref(), Some("label"));
+        assert_eq!(request.message.as_deref(), Some("message"));
+        assert_eq!(request.options.len(), 3);
+        assert_eq!(
+            request.options[1].errors,
+            vec![PaymentMethodParsingError::NetworkMismatch],
+        );
+        // Ark is preferred, but this one has an error, so lightning wins.
+        assert_eq!(request.default_option.as_ref(), Some(&request.options[2]));
+    }
+
+    #[test]
+    fn a_lightning_payment_result_carries_its_payment_hash() {
+        let invoice = regtest_invoice(Some(1_000), Ok(""), None);
+        let result = PaymentResult::from(bark::PaymentInitOutput::Lightning(invoice.clone().into()));
+        assert_eq!(
+            result,
+            PaymentResult::Lightning {
+                invoice: invoice.to_string(),
+                payment_hash: invoice.payment_hash().to_string(),
+            },
+        );
+        assert_eq!(serde_json::to_value(&result).unwrap()["type"], "lightning");
+        assert!(serde_json::to_value(&result).unwrap()["paymentHash"].is_string());
+        let ark = PaymentResult::from(bark::PaymentInitOutput::Ark(bark::movement::MovementId(7)));
+        assert_eq!(ark, PaymentResult::Ark { movement_id: 7 });
+        assert_eq!(
+            serde_json::to_value(&ark).unwrap(),
+            serde_json::json!({ "type": "ark", "movementId": 7 }),
+        );
+    }
+
+    /// The wasm binding takes the options as JSON, so omitted fields must get
+    /// the same defaults as in uniffi.
+    #[test]
+    fn bip321_uri_options_default_to_ark_and_lightning() {
+        let options: Bip321UriOptions = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(options.ark);
+        assert!(options.lightning);
+        assert_eq!(options.amount_sats, None);
+        assert_eq!(options.onchain_address, None);
+
+        let options: Bip321UriOptions =
+            serde_json::from_value(serde_json::json!({ "ark": false })).unwrap();
+        assert!(!options.ark);
+        assert!(options.lightning);
+    }
+
+    #[test]
+    fn a_built_uri_lists_its_destinations() {
+        use std::str::FromStr;
+        use bark::payment_request::BarkBip321Uri;
+
+        let invoice = regtest_invoice(Some(100_000_000), Ok("coffee"), None);
+        let text = format!(
+            "bitcoin:?amount=0.001&lightning={}&tb={}&ark={}",
+            invoice, REGTEST_ADDRESS, ARK,
+        );
+        let uri = BarkBip321Uri::from_str(&text).unwrap();
+
+        let built = Bip321Uri::from(&uri);
+        assert_eq!(built.ark_address.as_deref(), Some(ARK));
+        assert_eq!(built.onchain_address.as_deref(), Some(REGTEST_ADDRESS));
+        let lightning = built.lightning_invoice.unwrap();
+        assert_eq!(lightning.invoice, invoice.to_string());
+        assert_eq!(lightning.payment_hash, invoice.payment_hash().to_string());
+        assert_eq!(lightning.amount_sats, 100_000);
+        assert_eq!(BarkBip321Uri::from_str(&built.uri).unwrap(), uri);
     }
 }

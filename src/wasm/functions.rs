@@ -1,9 +1,11 @@
 #![allow(non_snake_case)]
 
+use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::*;
 
 use crate::error::Error;
 use crate::functions as core_fns;
+use crate::types::Bolt11InvoiceDetails;
 
 fn bark_err(e: Error) -> JsError {
     JsError::new(&e.message())
@@ -22,6 +24,13 @@ pub fn validate_mnemonic(mnemonic: String) -> Result<bool, JsError> {
 #[wasm_bindgen(js_name = validateArkAddress)]
 pub fn validate_ark_address(address: String) -> Result<bool, JsError> {
     core_fns::validate_ark_address(address).map_err(bark_err)
+}
+
+/// Decode a BOLT11 invoice, for example to show its amount, description,
+/// payee and expiry before paying it. Does not check its network or expiry.
+#[wasm_bindgen(js_name = decodeBolt11Invoice)]
+pub fn decode_bolt11_invoice(invoice: String) -> Result<Ts<Bolt11InvoiceDetails>, JsError> {
+    Ok(core_fns::decode_bolt11_invoice(invoice).map_err(bark_err)?.into_ts()?)
 }
 
 #[wasm_bindgen(js_name = extractTxFromPsbt)]
