@@ -1692,6 +1692,12 @@ impl Wallet {
         Ok(hex::encode(identifier.serialize()))
     }
 
+    /// The network, mailbox id and VTXO xpub, as `bark debug-info` prints
+    /// them, for support requests.
+    pub async fn debug_info(&self) -> Result<types::DebugInfo, Error> {
+        Ok(self.inner.debug_info().await?.into())
+    }
+
     /// Hex-encoded authorization to read this wallet's mailbox.
     pub fn mailbox_authorization(&self, expiry_secs: u32) -> Result<String, Error> {
         let auth = self.inner.mailbox_authorization(mailbox_auth_expiry(expiry_secs)?);

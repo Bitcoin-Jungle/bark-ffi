@@ -106,6 +106,40 @@ impl From<LogLevel> for log::LevelFilter {
 }
 
 // ============================================================================
+// DebugInfo
+// ============================================================================
+
+/// Wallet information that helps to debug issues, mirroring
+/// `bark::DebugInfo` (what `bark debug-info` prints). Users can share it in
+/// support requests.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DebugInfo {
+    pub network: Network,
+    /// The wallet's server mailbox id, hex-encoded like
+    /// `Wallet::mailbox_identifier`.
+    pub mailbox_id: String,
+    /// The xpub every VTXO keypair is derived from.
+    pub vtxo_xpub: String,
+}
+
+impl From<bark::DebugInfo> for DebugInfo {
+    fn from(d: bark::DebugInfo) -> Self {
+        Self {
+            network: d.network.into(),
+            // Displays as the hex public key, as `mailbox_identifier` encodes it.
+            mailbox_id: d.mailbox_id.to_string(),
+            vtxo_xpub: d.vtxo_xpub.to_string(),
+        }
+    }
+}
+
+// ============================================================================
 // WalletProperties
 // ============================================================================
 
@@ -2173,6 +2207,27 @@ mod tests {
     // ------------------------------------------------------------------
     // FeeSchedule (item: fee schedule as raw JSON)
     // ------------------------------------------------------------------
+
+    #[test]
+    fn debug_info_matches_the_other_encodings() {
+        use bitcoin::bip32::{Xpriv, Xpub};
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let xpub = Xpub::from_priv(&secp, &Xpriv::new_master(BtcNetwork::Regtest, &[7; 32]).unwrap());
+        let mailbox_id = ark::mailbox::MailboxIdentifier::from_pubkey(xpub.public_key);
+
+        let info: DebugInfo = bark::DebugInfo {
+            network: BtcNetwork::Regtest,
+            mailbox_id,
+            vtxo_xpub: xpub,
+        }
+        .into();
+
+        assert!(matches!(info.network, Network::Regtest));
+        // Same hex as `Wallet::mailbox_identifier`.
+        assert_eq!(info.mailbox_id, hex::encode(ark::ProtocolEncoding::serialize(&mailbox_id)));
+        assert_eq!(info.vtxo_xpub.parse::<Xpub>().unwrap(), xpub);
+    }
 
     /// The summary folds every pending field into one number, and the total
     /// adds the sats that need a refresh.

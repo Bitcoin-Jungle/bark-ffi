@@ -934,6 +934,13 @@ impl Wallet {
         self.core.mailbox_identifier()
     }
 
+    /// The network, mailbox id and VTXO xpub, as `bark debug-info` prints
+    /// them. Users can share this in support requests.
+    pub async fn debug_info(&self) -> Result<types::DebugInfo, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.debug_info().await }).await
+    }
+
     /// Create a hex-encoded authorization that lets whoever holds it read this
     /// wallet's mailbox from the Ark server for `expiry_secs` from now, so 86400
     /// for 24 hours. An authorization cannot be revoked early, so keep the

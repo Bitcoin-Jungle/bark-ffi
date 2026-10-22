@@ -13,7 +13,7 @@ use crate::core::onchain::OnchainWallet as CoreOnchainWallet;
 use crate::core::wallet::{seed_from_str, OpenArgs as CoreOpenArgs, Wallet as CoreWallet};
 use crate::error::Error;
 use crate::types::{
-    AddressWithIndex, ArkInfo, Balance, BalanceSummary, BoardFundingInfo,
+    AddressWithIndex, ArkInfo, Balance, BalanceSummary, BoardFundingInfo, DebugInfo,
     EmergencyExitFeeEstimate,
     ExitCancelResult, ExitClaimTransaction, ExitProgressStatus, ExitTransactionStatus, ExitVtxo,
     FeeEstimate, ImportVtxoArgs, LightningInvoice,
@@ -1031,6 +1031,13 @@ impl Wallet {
     #[wasm_bindgen(js_name = mailboxIdentifier)]
     pub fn mailbox_identifier(&self) -> Result<String, JsError> {
         Ok(self.core.mailbox_identifier()?)
+    }
+
+    /// The network, mailbox id and VTXO xpub, as `bark debug-info` prints
+    /// them. Users can share this in support requests.
+    #[wasm_bindgen(js_name = debugInfo)]
+    pub async fn debug_info(&self) -> Result<Ts<DebugInfo>, JsError> {
+        Ok(self.core.debug_info().await?.into_ts()?)
     }
 
     /// Create a hex-encoded authorization that lets whoever holds it read this
