@@ -13,7 +13,8 @@ use crate::core::onchain::OnchainWallet as CoreOnchainWallet;
 use crate::core::wallet::{seed_from_str, OpenArgs as CoreOpenArgs, Wallet as CoreWallet};
 use crate::error::Error;
 use crate::types::{
-    AddressWithIndex, ArkInfo, Balance, BoardFundingInfo, EmergencyExitFeeEstimate,
+    AddressWithIndex, ArkInfo, Balance, BalanceSummary, BoardFundingInfo,
+    EmergencyExitFeeEstimate,
     ExitCancelResult, ExitClaimTransaction, ExitProgressStatus, ExitTransactionStatus, ExitVtxo,
     FeeEstimate, ImportVtxoArgs, LightningInvoice,
     LightningReceive, LightningSend, LightningSendStatus, Movement, Network, OffboardResult,
@@ -407,6 +408,13 @@ impl Wallet {
 
     pub async fn balance(&self) -> Result<Ts<Balance>, JsError> {
         Ok(self.core.balance().await?.into_ts()?)
+    }
+
+    /// The numbers to show a user, without the breakdown of `balance`: what
+    /// they can spend, what needs a refresh, what is pending and the total.
+    #[wasm_bindgen(js_name = balanceSummary)]
+    pub async fn balance_summary(&self) -> Result<Ts<BalanceSummary>, JsError> {
+        Ok(self.core.balance_summary().await?.into_ts()?)
     }
 
     pub async fn vtxos(&self) -> Result<Vec<Ts<Vtxo>>, JsError> {

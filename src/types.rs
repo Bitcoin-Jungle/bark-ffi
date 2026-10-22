@@ -160,6 +160,42 @@ pub struct Balance {
     pub pending_offboard_sats: u64,
 }
 
+/// The numbers to show a user without the breakdown of [`Balance`],
+/// mirroring `bark::BalanceSummary`.
+///
+/// Show `spendable_sats` as what a user can pay with and `total_sats` as what
+/// a user owns.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct BalanceSummary {
+    /// Sats that can be spent right now.
+    pub spendable_sats: u64,
+    /// Sats that need a refresh before they can be sent again.
+    pub needs_refresh_sats: u64,
+    /// Sats held by operations in progress. They either come back as
+    /// spendable or leave the wallet, for example to the onchain wallet.
+    pub pending_sats: u64,
+    /// All sats that belong to the wallet:
+    /// `spendable_sats + needs_refresh_sats + pending_sats`.
+    pub total_sats: u64,
+}
+
+impl From<bark::BalanceSummary> for BalanceSummary {
+    fn from(s: bark::BalanceSummary) -> Self {
+        Self {
+            spendable_sats: s.spendable.to_sat(),
+            needs_refresh_sats: s.needs_refresh.to_sat(),
+            pending_sats: s.pending.to_sat(),
+            total_sats: s.total.to_sat(),
+        }
+    }
+}
+
 impl From<BarkBalance> for Balance {
     fn from(b: BarkBalance) -> Self {
         Self {
@@ -2137,6 +2173,36 @@ mod tests {
     // ------------------------------------------------------------------
     // FeeSchedule (item: fee schedule as raw JSON)
     // ------------------------------------------------------------------
+
+    /// The summary folds every pending field into one number, and the total
+    /// adds the sats that need a refresh.
+    #[test]
+    fn balance_summary_conversion() {
+        use bitcoin::Amount;
+
+        let sat = Amount::from_sat;
+        let balance = BarkBalance {
+            spendable: sat(1000),
+            needs_refresh: sat(200),
+            pending_lightning_send: sat(1),
+            claimable_lightning_receive: sat(2),
+            pending_in_round: sat(4),
+            pending_exit: sat(8),
+            pending_board: sat(16),
+            pending_arkoor_send: sat(32),
+            pending_offboard: sat(64),
+        };
+
+        assert_eq!(
+            BalanceSummary::from(balance.summary()),
+            BalanceSummary {
+                spendable_sats: 1000,
+                needs_refresh_sats: 200,
+                pending_sats: 127,
+                total_sats: 1327,
+            },
+        );
+    }
 
     /// Mirrors bark-json's `EmergencyExitFeeEstimateResponse`: total is the
     /// sum of both legs and the rate is rounded up to whole sat/vB.

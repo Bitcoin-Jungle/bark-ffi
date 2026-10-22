@@ -196,6 +196,13 @@ impl Wallet {
         run_async(async move { core.balance().await }).await
     }
 
+    /// The numbers to show a user, without the breakdown of `balance`: what
+    /// they can spend, what needs a refresh, what is pending and the total.
+    pub async fn balance_summary(&self) -> Result<types::BalanceSummary, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.balance_summary().await }).await
+    }
+
     pub async fn vtxos(&self) -> Result<Vec<types::Vtxo>, Error> {
         let core = self.core.clone();
         run_async(async move { core.vtxos().await }).await

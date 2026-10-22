@@ -345,6 +345,13 @@ impl Wallet {
         Ok(self.inner.balance().await?.into())
     }
 
+    /// The numbers to show a user, without the breakdown of [`Self::balance`]:
+    /// what they can spend, what needs a refresh, what is pending and the
+    /// total.
+    pub async fn balance_summary(&self) -> Result<types::BalanceSummary, Error> {
+        Ok(self.inner.balance().await?.summary().into())
+    }
+
     pub async fn vtxos(&self) -> Result<Vec<types::Vtxo>, Error> {
         Ok(self
             .inner
