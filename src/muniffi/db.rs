@@ -15,7 +15,7 @@ use crate::types::Network;
 /// Database filename bark-ffi used before v0.3.0. Still honoured on open.
 const LEGACY_DB_FILE: &str = "bark.sqlite";
 
-/// What [`datadir_info`] found in a wallet directory.
+/// What [`read_datadir_info`] found in a wallet directory.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct DatadirInfo {
     /// Path of the database file that was read.
@@ -50,21 +50,24 @@ fn existing_db_path(datadir: &Path) -> Option<PathBuf> {
 /// mistaken for an absent one.
 #[uniffi::export]
 pub fn wallet_exists(datadir: String) -> Result<bool, Error> {
-    Ok(datadir_info(datadir)?.is_some())
+    Ok(read_datadir_info(datadir)?.is_some())
 }
 
 /// Network and seed fingerprint of the wallet in `datadir`, or `None` when no
 /// wallet is initialized there. Same side-effect guarantees as
 /// [`wallet_exists`].
+///
+/// Not named `datadir_info`: the Go bindings would export it as `DatadirInfo`,
+/// which collides with the record of the same name.
 #[uniffi::export]
-pub fn datadir_info(datadir: String) -> Result<Option<DatadirInfo>, Error> {
+pub fn read_datadir_info(datadir: String) -> Result<Option<DatadirInfo>, Error> {
     let Some(db_path) = existing_db_path(Path::new(&datadir)) else {
         return Ok(None);
     };
-    Ok(read_datadir_info(&db_path)?)
+    Ok(read_wallet_properties(&db_path)?)
 }
 
-fn read_datadir_info(db_path: &Path) -> anyhow::Result<Option<DatadirInfo>> {
+fn read_wallet_properties(db_path: &Path) -> anyhow::Result<Option<DatadirInfo>> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -199,7 +202,7 @@ mod tests {
     fn initialized_wallet_reports_network_and_fingerprint() {
         let dir = tmp_datadir("init");
         write_properties(&dir.join(DEFAULT_DB_FILE), "signet", "deadbeef");
-        let info = datadir_info(dir.to_string_lossy().into_owned()).unwrap().unwrap();
+        let info = read_datadir_info(dir.to_string_lossy().into_owned()).unwrap().unwrap();
         assert!(matches!(info.network, Network::Signet));
         assert_eq!(info.fingerprint, "deadbeef");
         assert!(info.db_file.ends_with(DEFAULT_DB_FILE));
@@ -210,7 +213,7 @@ mod tests {
     fn legacy_filename_is_honoured() {
         let dir = tmp_datadir("legacy");
         write_properties(&dir.join(LEGACY_DB_FILE), "bitcoin", "cafebabe");
-        let info = datadir_info(dir.to_string_lossy().into_owned()).unwrap().unwrap();
+        let info = read_datadir_info(dir.to_string_lossy().into_owned()).unwrap().unwrap();
         assert!(matches!(info.network, Network::Bitcoin));
         assert!(info.db_file.ends_with(LEGACY_DB_FILE));
     }

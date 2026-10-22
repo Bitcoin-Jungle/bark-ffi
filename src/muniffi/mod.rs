@@ -7,7 +7,7 @@ pub mod wallet;
 
 pub use crate::core::notification::NotificationHolder;
 pub use custom_onchain_wallet::CustomOnchainWalletCallbacks;
-pub use db::{datadir_info, wallet_exists, DatadirInfo};
+pub use db::{read_datadir_info, wallet_exists, DatadirInfo};
 pub use logger::{clear_logger, set_logger, BarkLogger};
 pub use onchain::OnchainWallet;
 pub use wallet::Wallet;
