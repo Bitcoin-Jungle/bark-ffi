@@ -384,9 +384,13 @@ impl Wallet {
         &self,
         threshold_blocks: u32,
     ) -> Result<Vec<types::Vtxo>, Error> {
+        // Saturating is lossless: a VTXO's lifetime is itself a u16 block
+        // count, so u16::MAX already covers every VTXO.
+        let threshold = bark_bitcoin_ext::BlockDelta::try_from(threshold_blocks)
+            .unwrap_or(bark_bitcoin_ext::BlockDelta::new(u16::MAX));
         Ok(self
             .inner
-            .get_expiring_vtxos(threshold_blocks)
+            .get_expiring_vtxos(threshold)
             .await?
             .into_iter()
             .map(Into::into)
@@ -560,10 +564,7 @@ impl Wallet {
     ) -> Result<types::OffboardResult, Error> {
         let addr = parse_address(&bitcoin_address, self.inner.network().await?)?;
 
-        let txid = self.inner.offboard_all(addr).await?;
-        Ok(types::OffboardResult {
-            txid: txid.to_string(),
-        })
+        Ok(self.inner.offboard_all(addr).await?.into())
     }
 
     pub async fn offboard_vtxos(
@@ -578,10 +579,7 @@ impl Wallet {
             .map(|id| id.parse::<VtxoId>().context("invalid vtxo id"))
             .collect();
 
-        let txid = self.inner.offboard_vtxos(ids?, addr).await?;
-        Ok(types::OffboardResult {
-            txid: txid.to_string(),
-        })
+        Ok(self.inner.offboard_vtxos(ids?, addr).await?.into())
     }
 
     // ------------------------------------------------------------------------
@@ -898,15 +896,17 @@ impl Wallet {
     /// An address this bark cannot deliver to (see
     /// [`Self::validate_arkoor_address`]) is rejected up front, leaving the
     /// selected VTXOs spendable, rather than cosigned and then retried forever.
+    ///
+    /// Returns the id of the movement that records the payment.
     pub async fn send_arkoor_payment(
         &self,
         ark_address: String,
         amount_sats: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         let addr: ark::Address = ark_address.parse().context("invalid ark address")?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
-        self.inner.send_arkoor_payment(&addr, amount).await?;
-        Ok(())
+        let movement_id = self.inner.send_arkoor_payment(&addr, amount).await?;
+        Ok(movement_id.0)
     }
 
     /// Whether this wallet can pay `address` out-of-round: same network and
@@ -926,15 +926,16 @@ impl Wallet {
     // Onchain send (from offchain balance)
     // ------------------------------------------------------------------------
 
+    /// Send `amount_sats` from the offchain balance to an onchain address,
+    /// as an offboard. Returns the offboard txid and its movement id.
     pub async fn send_onchain(
         &self,
         address: String,
         amount_sats: u64,
-    ) -> Result<String, Error> {
+    ) -> Result<types::OffboardResult, Error> {
         let addr = parse_address(&address, self.inner.network().await?)?;
         let amount = bitcoin::Amount::from_sat(amount_sats);
-        let txid = self.inner.send_onchain(addr, amount).await?;
-        Ok(txid.to_string())
+        Ok(self.inner.send_onchain(addr, amount).await?.into())
     }
 
     // ------------------------------------------------------------------------
@@ -1022,7 +1023,7 @@ impl Wallet {
 
         let state = self
             .inner
-            .refresh_vtxos_scheduled(ids, scheduled_height)
+            .refresh_vtxos_scheduled(ids, scheduled_height.into())
             .await?;
         Ok(state.map(|s| s.into()))
     }
@@ -1086,13 +1087,13 @@ impl Wallet {
                 .map(|p| p.to_string_lossy().to_string()),
             bitcoind_user: cfg.bitcoind_user.clone(),
             bitcoind_pass: None,
-            vtxo_refresh_expiry_threshold: Some(cfg.vtxo_refresh_expiry_threshold),
-            vtxo_exit_margin: Some(cfg.vtxo_exit_margin),
-            htlc_recv_claim_delta: Some(cfg.htlc_recv_claim_delta),
+            vtxo_refresh_expiry_threshold: Some(cfg.vtxo_refresh_expiry_threshold.to_u16()),
+            vtxo_exit_margin: Some(cfg.vtxo_exit_margin.to_u16()),
+            htlc_recv_claim_delta: Some(cfg.htlc_recv_claim_delta.to_u16()),
             fallback_fee_rate: cfg.fallback_fee_rate.map(|r| r.to_sat_per_kwu()),
-            round_tx_required_confirmations: Some(cfg.round_tx_required_confirmations),
+            round_tx_required_confirmations: Some(cfg.round_tx_required_confirmations.to_u32()),
             daemon_sync_interval_secs: Some(cfg.daemon_sync_interval_secs),
-            offboard_required_confirmations: Some(cfg.offboard_required_confirmations),
+            offboard_required_confirmations: Some(cfg.offboard_required_confirmations.to_u32()),
             daemon_manual_sync: Some(cfg.daemon_manual_sync),
             lightning_receive_claim_retries: Some(cfg.lightning_receive_claim_retries),
             user_agent: cfg.user_agent.clone(),
@@ -1184,7 +1185,7 @@ impl Wallet {
 
         Ok(types::BoardFundingInfo {
             address: address.to_string(),
-            expiry_height,
+            expiry_height: expiry_height.to_u32(),
             keypair_index,
         })
     }
@@ -1216,7 +1217,7 @@ impl Wallet {
 
         let pb = self
             .inner
-            .board_psbt(psbt, keypair, expiry_height)
+            .board_psbt(psbt, keypair, expiry_height.into())
             .await
             .context("Board psbt failed")?;
 
@@ -1470,17 +1471,16 @@ impl Wallet {
         Ok(exit_guard.has_pending_exits().await)
     }
 
+    /// Sats in VTXOs whose exit has committed on chain but has not been
+    /// claimed yet: `balance().pending_exit_sats`.
     pub async fn pending_exits_total_sats(&self) -> Result<u64, Error> {
-        let exit_guard = self.inner.exit_mgr();
-        Ok(exit_guard
-            .try_pending_total()
-            .unwrap_or(bitcoin::Amount::ZERO)
-            .to_sat())
+        let balance = self.inner.balance().await.context("Failed to compute balance")?;
+        Ok(balance.pending_exit.to_sat())
     }
 
     pub async fn all_exits_claimable_at_height(&self) -> Result<Option<u32>, Error> {
         let exit_guard = self.inner.exit_mgr();
-        Ok(exit_guard.all_claimable_at_height().await)
+        Ok(exit_guard.all_claimable_at_height().await.map(|h| h.to_u32()))
     }
 
     pub async fn get_exit_status(
@@ -1633,11 +1633,11 @@ impl Wallet {
     // ------------------------------------------------------------------------
 
     pub async fn get_first_expiring_vtxo_blockheight(&self) -> Result<Option<u32>, Error> {
-        Ok(self.inner.get_first_expiring_vtxo_blockheight().await?)
+        Ok(self.inner.get_first_expiring_vtxo_blockheight().await?.map(|h| h.to_u32()))
     }
 
     pub async fn get_next_required_refresh_blockheight(&self) -> Result<Option<u32>, Error> {
-        Ok(self.inner.get_next_required_refresh_blockheight().await?)
+        Ok(self.inner.get_next_required_refresh_blockheight().await?.map(|h| h.to_u32()))
     }
 
     // ------------------------------------------------------------------------
@@ -1899,17 +1899,21 @@ impl Wallet {
     /// affects the claim transaction's weight; when `None` a placeholder P2TR
     /// address on the wallet's network is used.
     ///
-    /// The estimate reflects current chain state: exit transactions already
-    /// confirmed cost nothing. The onchain wallet is synced first so that
-    /// `fundable` sees the current confirmed balance.
+    /// `fee_margin` scales the broadcast leg to cover feerate movement and
+    /// UTXO consolidation; it must be finite and non-negative and defaults to
+    /// bark's 1.2.
     ///
-    /// Requires an onchain wallet that can simulate the CPFP walk (the BDK
-    /// wallet does; uniffi callback wallets do not and return an error).
+    /// The estimate reflects current chain state: exit transactions already
+    /// confirmed cost nothing. It is pure weight arithmetic and never reads
+    /// the onchain wallet, so it works before the wallet holds funds and with
+    /// any onchain wallet. Only the deprecated `fundable` reads its last
+    /// synced balance.
     pub async fn estimate_emergency_exit_fee(
         &self,
         vtxo_ids: Vec<String>,
         fee_rate_sat_per_vb: Option<u64>,
         destination: Option<String>,
+        fee_margin: Option<f64>,
     ) -> Result<types::EmergencyExitFeeEstimate, Error> {
         let ids = if vtxo_ids.is_empty() {
             self.inner
@@ -1933,19 +1937,20 @@ impl Wallet {
             None => None,
         };
 
-        // Sync the onchain wallet so the `fundable` check sees current
-        // confirmed funds, like bark-rest does.
-        self.inner
-            .sync_onchain()
-            .await
-            .context("Failed to sync onchain wallet")?;
-
         let estimate = self
             .inner
-            .estimate_emergency_exit_fee(&ids, fee_rate, destination)
+            .estimate_emergency_exit_fee(&ids, fee_rate, destination, fee_margin)
             .await
             .context("Failed to estimate emergency exit fee")?;
-        Ok(estimate.into())
+
+        // Only feeds the deprecated `fundable`, so the last synced balance
+        // will do, like bark-rest.
+        let onchain_balance = match self.inner.onchain() {
+            Some(w) => Some(w.read().await.balance().await),
+            None => None,
+        };
+
+        Ok(types::EmergencyExitFeeEstimate::new(estimate, onchain_balance))
     }
 }
 

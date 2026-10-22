@@ -12,7 +12,7 @@ use log::{error, warn};
 use bitcoin::{Address, Amount, FeeRate, Psbt, Script, ScriptBuf, Transaction};
 
 use bark::chain::ChainSource;
-use bark::onchain::{CpfpError, CpfpWalkEstimate, MakeCpfpFees, OnchainWalletTrait};
+use bark::onchain::{CpfpError, MakeCpfpFees, OnchainWalletTrait};
 
 use crate::error::Error;
 use crate::types::{CpfpParams, Destination};
@@ -56,7 +56,11 @@ pub trait CustomOnchainWalletCallbacks: Send + Sync {
         fee_rate_sat_per_vb: u64,
     ) -> Result<String, Error>;
 
-    /// Sign and finalize a PSBT
+    /// Sign and finalize a PSBT, without recording the transaction
+    ///
+    /// The wallet must not treat the transaction as spent yet: a board that
+    /// fails after signing has to leave the wallet untouched. Once the
+    /// transaction is broadcast, Bark reports it through `register_tx`.
     ///
     /// # Arguments
     /// * `psbt_base64` - Base64-encoded PSBT
@@ -64,7 +68,7 @@ pub trait CustomOnchainWalletCallbacks: Send + Sync {
     /// # Returns
     /// Base64-encoded fully signed PSBT (all witnesses filled in). Rejected
     /// unless the unsigned transaction is unchanged.
-    fn finish_psbt(&self, psbt_base64: String) -> Result<String, Error>;
+    fn sign_psbt(&self, psbt_base64: String) -> Result<String, Error>;
 
     /// Whether a script pubkey belongs to the wallet's keychains
     ///
@@ -283,7 +287,7 @@ impl OnchainWalletTrait for CallbackWalletAdapter {
         Ok(psbt)
     }
 
-    async fn finish_psbt(&mut self, psbt: Psbt) -> anyhow::Result<Psbt> {
+    async fn sign_psbt(&mut self, psbt: Psbt) -> anyhow::Result<Psbt> {
         // Serialize PSBT to base64
         use base64::Engine;
         let psbt_bytes = psbt.serialize();
@@ -292,8 +296,8 @@ impl OnchainWalletTrait for CallbackWalletAdapter {
         // Call callback
         let signed_base64 = self
             .callbacks
-            .finish_psbt(psbt_base64)
-            .map_err(|e| anyhow::anyhow!("finish_psbt failed: {}", e.message()))?;
+            .sign_psbt(psbt_base64)
+            .map_err(|e| anyhow::anyhow!("sign_psbt failed: {}", e.message()))?;
 
         // Decode the fully signed PSBT returned by the callback
         let signed_bytes = base64::engine::general_purpose::STANDARD.decode(&signed_base64)?;
@@ -301,9 +305,19 @@ impl OnchainWalletTrait for CallbackWalletAdapter {
 
         // Signing fills in witnesses; it must not touch inputs or outputs.
         if signed_psbt.unsigned_tx != psbt.unsigned_tx {
-            bail!("finish_psbt returned a different transaction than it was given");
+            bail!("sign_psbt returned a different transaction than it was given");
         }
 
+        Ok(signed_psbt)
+    }
+
+    /// Sign, then record the transaction through `register_tx`.
+    ///
+    /// Bark itself no longer calls this; it is here for the trait.
+    async fn finish_psbt(&mut self, psbt: Psbt) -> anyhow::Result<Psbt> {
+        let signed_psbt = self.sign_psbt(psbt).await?;
+        let tx = signed_psbt.clone().extract_tx()?;
+        self.register_tx(&tx).await?;
         Ok(signed_psbt)
     }
 
@@ -356,22 +370,6 @@ impl OnchainWalletTrait for CallbackWalletAdapter {
         }
 
         Ok(cpfp_tx)
-    }
-
-    /// Not supported for callback wallets.
-    ///
-    /// Estimating the exit cost means replaying the whole CPFP broadcast walk
-    /// without mutating the wallet, which the callback interface cannot express:
-    /// [CustomOnchainWalletCallbacks::make_signed_p2a_cpfp] is free to consume
-    /// addresses and coins. Only `Wallet::estimate_emergency_exit_fee` needs
-    /// this, so the rest of the wallet is unaffected.
-    fn estimate_p2a_cpfp_walk(
-        &self,
-        _parents: &[(Transaction, MakeCpfpFees)],
-    ) -> Result<CpfpWalkEstimate, CpfpError> {
-        Err(CpfpError::InternalError(
-            "estimate_p2a_cpfp_walk() not supported for callback wallets".into(),
-        ))
     }
 
     async fn store_signed_p2a_cpfp(&mut self, tx: &Transaction) -> anyhow::Result<(), CpfpError> {

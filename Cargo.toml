@@ -42,19 +42,19 @@ wasm-web = [
 [dependencies.ark]
 package = "ark-lib"
 git = "https://gitlab.com/ark-bitcoin/bark"
-rev = "bark-0.7.1"
+rev = "bark-0.8.0"
 default-features = false
 
 [dependencies.bark]
 package = "bark-wallet"
 git = "https://gitlab.com/ark-bitcoin/bark"
-rev = "bark-0.7.1"
+rev = "bark-0.8.0"
 default-features = false
 
 [dependencies.bark-bitcoin-ext]
 package = "bark-bitcoin-ext"
 git = "https://gitlab.com/ark-bitcoin/bark"
-rev = "bark-0.7.1"
+rev = "bark-0.8.0"
 default-features = false
 
 [dependencies]

@@ -142,25 +142,38 @@ impl From<BarkWalletProperties> for WalletProperties {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Balance {
+    /// Sats that can be spent right now. Excludes `needs_refresh_sats`.
     pub spendable_sats: u64,
+    /// Sats in VTXOs that have expired or reached the server's maximum exit
+    /// depth. They can still be offboarded, exited or refreshed, but not sent
+    /// out-of-round until maintenance has refreshed them.
+    pub needs_refresh_sats: u64,
     pub pending_in_round_sats: u64,
     pub pending_exit_sats: u64,
     pub pending_lightning_send_sats: u64,
     pub claimable_lightning_receive_sats: u64,
     pub pending_board_sats: u64,
+    /// Sats locked in an outgoing arkoor payment that has not completed yet.
+    pub pending_arkoor_send_sats: u64,
+    /// Sats locked in an offboard whose transaction has not been broadcast
+    /// yet, including any change that comes back.
+    pub pending_offboard_sats: u64,
 }
 
 impl From<BarkBalance> for Balance {
     fn from(b: BarkBalance) -> Self {
         Self {
             spendable_sats: b.spendable.to_sat(),
+            needs_refresh_sats: b.needs_refresh.to_sat(),
             pending_in_round_sats: b.pending_in_round.to_sat(),
-            pending_exit_sats: b.pending_exit.unwrap_or_default().to_sat(),
+            pending_exit_sats: b.pending_exit.to_sat(),
             pending_lightning_send_sats: b.pending_lightning_send.to_sat(),
             // Note: Bark's Balance only has claimable_lightning_receive field.
             // There is no separate "total pending receive" field in upstream.
             claimable_lightning_receive_sats: b.claimable_lightning_receive.to_sat(),
             pending_board_sats: b.pending_board.to_sat(),
+            pending_arkoor_send_sats: b.pending_arkoor_send.to_sat(),
+            pending_offboard_sats: b.pending_offboard.to_sat(),
         }
     }
 }
@@ -283,7 +296,7 @@ impl From<BarkWalletVtxo> for Vtxo {
         Self {
             id: v.vtxo.id().to_string(),
             amount_sats: v.vtxo.amount().to_sat(),
-            expiry_height: v.vtxo.expiry_height(),
+            expiry_height: v.vtxo.expiry_height().to_u32(),
             kind: format!("{:?}", v.vtxo.policy_type()),
             state: (&v.state).into(),
             exit_depth: v.exit_depth as u32,
@@ -314,6 +327,8 @@ pub struct LightningInvoice {
 // OffboardResult
 // ============================================================================
 
+/// What `offboard_all`, `offboard_vtxos` and `send_onchain` broadcast,
+/// mirroring `bark::OffboardResult`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "wasm-web",
@@ -322,7 +337,19 @@ pub struct LightningInvoice {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct OffboardResult {
+    /// The offboard transaction the server built and bark broadcast.
     pub txid: String,
+    /// The movement that records this offboard.
+    pub movement_id: u32,
+}
+
+impl From<bark::OffboardResult> for OffboardResult {
+    fn from(r: bark::OffboardResult) -> Self {
+        Self {
+            txid: r.txid.to_string(),
+            movement_id: r.movement_id.0,
+        }
+    }
 }
 
 // ============================================================================
@@ -625,38 +652,43 @@ impl From<bark::FeeEstimate> for FeeEstimate {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct EmergencyExitFeeEstimate {
-    /// CPFP fees to broadcast every not-yet-confirmed exit transaction. Paid
-    /// now from confirmed onchain funds; this is the minimum onchain balance
-    /// an emergency exit needs.
+    /// CPFP fees to broadcast every not-yet-confirmed exit transaction,
+    /// scaled by the fee margin, so deliberately above `fee_rate × weight`.
+    /// Paid now from confirmed onchain funds; this is the onchain balance to
+    /// fund the exit with at that margin.
     pub exit_broadcast_fee_sats: u64,
     /// Fee of the single batched transaction that later drains the matured
     /// exit outputs. Subtracted from the exited amount.
     pub claim_fee_sats: u64,
     /// `exit_broadcast_fee_sats + claim_fee_sats`.
     pub total_fee_sats: u64,
-    /// Fee rate the exit-broadcast leg was priced at (sat/vB, rounded up).
-    /// Unless an explicit rate was supplied, the claim leg is priced
-    /// separately at the chain's `regular` rate.
+    /// Fee rate the exit-broadcast leg was priced at, before the fee margin
+    /// (sat/vB, rounded up). Unless an explicit rate was supplied, the claim
+    /// leg is priced separately at the chain's `regular` rate.
     pub fee_rate_sat_per_vb: u64,
     /// Number of exit transactions that still need to be broadcast and
     /// CPFP-bumped. Already-confirmed tree transactions are not counted.
     pub txs_to_broadcast: u64,
-    /// Whether the wallet's current confirmed onchain balance covers the full
-    /// serial broadcast walk. Each CPFP child can only spend confirmed coins,
-    /// so `false` means the exit would stall midway even if a single bump
-    /// looks affordable.
+    /// Whether the onchain wallet's last synced balance covers
+    /// `exit_broadcast_fee_sats`. `false` without an onchain wallet.
+    ///
+    /// Deprecated: bark dropped this field. Compare `exit_broadcast_fee_sats`
+    /// against the onchain balance instead; this one goes away in a later
+    /// release, as it does in bark-rest.
     pub fundable: bool,
 }
 
-impl From<bark::exit::ExitFeeEstimate> for EmergencyExitFeeEstimate {
-    fn from(e: bark::exit::ExitFeeEstimate) -> Self {
+impl EmergencyExitFeeEstimate {
+    /// Builds the estimate from bark's and the onchain balance, which only
+    /// feeds the deprecated `fundable`.
+    pub(crate) fn new(e: bark::exit::ExitFeeEstimate, onchain_balance: Option<bitcoin::Amount>) -> Self {
         Self {
             total_fee_sats: e.total().to_sat(),
             exit_broadcast_fee_sats: e.exit_broadcast_fee.to_sat(),
             claim_fee_sats: e.claim_fee.to_sat(),
             fee_rate_sat_per_vb: e.fee_rate.to_sat_per_vb_ceil(),
             txs_to_broadcast: e.txs_to_broadcast as u64,
-            fundable: e.fundable,
+            fundable: onchain_balance.is_some_and(|b| b >= e.exit_broadcast_fee),
         }
     }
 }
@@ -788,17 +820,14 @@ impl From<&bark::onchain::Utxo> for OnchainUtxo {
     fn from(u: &bark::onchain::Utxo) -> Self {
         match u {
             bark::onchain::Utxo::Local(l) => Self::Local {
-                outpoint: OutPoint {
-                    txid: l.outpoint.txid.to_string(),
-                    vout: l.outpoint.vout,
-                },
+                outpoint: (&l.outpoint).into(),
                 amount_sats: l.amount.to_sat(),
-                confirmation_height: l.confirmation_height,
+                confirmation_height: l.confirmation_height.map(|h| h.to_u32()),
             },
             bark::onchain::Utxo::Exit(e) => Self::Exit {
                 vtxo_id: e.vtxo.id().to_string(),
                 amount_sats: e.vtxo.amount().to_sat(),
-                height: e.height,
+                height: e.height.to_u32(),
             },
         }
     }
@@ -1055,14 +1084,14 @@ impl From<&bark::ark::ArkInfo> for ArkInfo {
             server_pubkey: info.server_pubkey.serialize().as_hex().to_string(),
             round_interval_secs: info.round_interval.as_secs(),
             nb_round_nonces: info.nb_round_nonces as u32,
-            vtxo_exit_delta: info.vtxo_exit_delta as u32,
-            vtxo_lifetime: info.vtxo_lifetime as u32,
-            vtxo_expiry_delta: info.vtxo_lifetime as u32,
-            htlc_send_expiry_delta: info.htlc_send_expiry_delta as u32,
-            htlc_expiry_delta: info.htlc_expiry_delta as u32,
+            vtxo_exit_delta: info.vtxo_exit_delta.to_u32(),
+            vtxo_lifetime: info.vtxo_lifetime.to_u32(),
+            vtxo_expiry_delta: info.vtxo_lifetime.to_u32(),
+            htlc_send_expiry_delta: info.htlc_send_expiry_delta.to_u32(),
+            htlc_expiry_delta: info.htlc_expiry_delta.to_u32(),
             max_vtxo_amount_sats: info.max_vtxo_amount.map(|a| a.to_sat()),
             required_board_confirmations: info.required_board_confirmations as u32,
-            max_user_invoice_cltv_delta: info.max_user_invoice_cltv_delta,
+            max_user_invoice_cltv_delta: info.max_user_invoice_cltv_delta.to_u16(),
             min_board_amount_sats: info.min_board_amount.to_sat(),
             ln_receive_anti_dos_required: info.ln_receive_anti_dos_required,
             fee_schedule: (&info.fees).into(),
@@ -1190,7 +1219,8 @@ impl From<&bark::exit::ExitTx> for ExitTx {
 ///
 /// Serde/TS tags match upstream's kebab-case serialization (`"start"`,
 /// `"processing"`, `"awaiting-delta"`, `"claimable"`, `"claim-in-progress"`,
-/// `"claimed"`, `"vtxo-already-spent"`, `"canceled"`), with camelCase fields.
+/// `"claimed"`, `"vtxo-already-spent"`, `"vtxo-swept"`, `"canceled"`), with
+/// camelCase fields.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 #[cfg_attr(
@@ -1233,6 +1263,14 @@ pub enum ExitState {
     /// Terminal: the VTXO was already spent offchain, so the exit cannot
     /// proceed.
     VtxoAlreadySpent { tip_height: u32 },
+    /// Terminal: an output the exit chain needs was spent on chain by someone
+    /// else, in practice the server sweeping a VTXO that expired mid-exit.
+    /// `spent_inputs` are the exit transaction inputs that were taken. A
+    /// refresh may still be possible.
+    VtxoSwept {
+        tip_height: u32,
+        spent_inputs: Vec<OutPoint>,
+    },
     /// Resumable: the user canceled the exit before its final transaction
     /// was broadcast. The VTXO stays spendable.
     Canceled { tip_height: u32 },
@@ -1242,33 +1280,37 @@ impl From<&bark::exit::ExitState> for ExitState {
     fn from(s: &bark::exit::ExitState) -> Self {
         use bark::exit::ExitState as B;
         match s {
-            B::Start(v) => Self::Start { tip_height: v.tip_height },
+            B::Start(v) => Self::Start { tip_height: v.tip_height.to_u32() },
             B::Processing(v) => Self::Processing {
-                tip_height: v.tip_height,
+                tip_height: v.tip_height.to_u32(),
                 transactions: v.transactions.iter().map(Into::into).collect(),
             },
             B::AwaitingDelta(v) => Self::AwaitingDelta {
-                tip_height: v.tip_height,
+                tip_height: v.tip_height.to_u32(),
                 confirmed_block: (&v.confirmed_block).into(),
-                claimable_height: v.claimable_height,
+                claimable_height: v.claimable_height.to_u32(),
             },
             B::Claimable(v) => Self::Claimable {
-                tip_height: v.tip_height,
+                tip_height: v.tip_height.to_u32(),
                 claimable_since: (&v.claimable_since).into(),
                 last_scanned_block: v.last_scanned_block.as_ref().map(Into::into),
             },
             B::ClaimInProgress(v) => Self::ClaimInProgress {
-                tip_height: v.tip_height,
+                tip_height: v.tip_height.to_u32(),
                 claimable_since: (&v.claimable_since).into(),
                 claim_txid: v.claim_txid.to_string(),
             },
             B::Claimed(v) => Self::Claimed {
-                tip_height: v.tip_height,
+                tip_height: v.tip_height.to_u32(),
                 txid: v.txid.to_string(),
                 block: (&v.block).into(),
             },
-            B::VtxoAlreadySpent(v) => Self::VtxoAlreadySpent { tip_height: v.tip_height },
-            B::Canceled(v) => Self::Canceled { tip_height: v.tip_height },
+            B::VtxoAlreadySpent(v) => Self::VtxoAlreadySpent { tip_height: v.tip_height.to_u32() },
+            B::VtxoSwept(v) => Self::VtxoSwept {
+                tip_height: v.tip_height.to_u32(),
+                spent_inputs: v.spent_inputs.iter().map(Into::into).collect(),
+            },
+            B::Canceled(v) => Self::Canceled { tip_height: v.tip_height.to_u32() },
         }
     }
 }
@@ -1294,6 +1336,7 @@ pub enum ExitStateKind {
     ClaimInProgress,
     Claimed,
     VtxoAlreadySpent,
+    VtxoSwept,
     Canceled,
 }
 
@@ -1308,6 +1351,7 @@ impl From<bark::exit::ExitStateKind> for ExitStateKind {
             B::ClaimInProgress => Self::ClaimInProgress,
             B::Claimed => Self::Claimed,
             B::VtxoAlreadySpent => Self::VtxoAlreadySpent,
+            B::VtxoSwept => Self::VtxoSwept,
             B::Canceled => Self::Canceled,
         }
     }
@@ -1534,7 +1578,7 @@ impl From<StoredRoundState<Unlocked>> for RoundState {
             id: rs.id().0,
             ongoing: rs.state().ongoing_participation(),
             state: rs.state().flow_kind().into(),
-            scheduled_height: rs.state().scheduled_height(),
+            scheduled_height: rs.state().scheduled_height().map(|h| h.to_u32()),
         }
     }
 }
@@ -1735,7 +1779,7 @@ pub struct Destination {
 }
 
 /// A Bitcoin transaction outpoint (reference to a previous output)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(
     feature = "wasm-web",
     derive(tsify::Tsify),
@@ -1745,6 +1789,15 @@ pub struct Destination {
 pub struct OutPoint {
     pub txid: String,
     pub vout: u32,
+}
+
+impl From<&bitcoin::OutPoint> for OutPoint {
+    fn from(o: &bitcoin::OutPoint) -> Self {
+        Self {
+            txid: o.txid.to_string(),
+            vout: o.vout,
+        }
+    }
 }
 
 /// Reference to a block in the blockchain
@@ -1763,7 +1816,7 @@ pub struct BlockRef {
 impl From<&bark_bitcoin_ext::BlockRef> for BlockRef {
     fn from(br: &bark_bitcoin_ext::BlockRef) -> Self {
         Self {
-            height: br.height,
+            height: br.height.to_u32(),
             hash: br.hash.to_string(),
         }
     }
@@ -1854,7 +1907,7 @@ mod tests {
 
     fn block_ref(height: u32, byte: u8) -> bark_bitcoin_ext::BlockRef {
         bark_bitcoin_ext::BlockRef {
-            height,
+            height: height.into(),
             hash: bitcoin::BlockHash::from_str(&hex::encode([byte; 32])).unwrap(),
         }
     }
@@ -1968,7 +2021,7 @@ mod tests {
         use bark::exit as be;
 
         let claimed: ExitState = (&be::ExitState::Claimed(be::ExitClaimedState {
-            tip_height: 900,
+            tip_height: 900.into(),
             txid: txid(0xaa),
             block: block_ref(890, 0xbb),
         }))
@@ -1983,9 +2036,9 @@ mod tests {
         );
 
         let awaiting: ExitState = (&be::ExitState::AwaitingDelta(be::ExitAwaitingDeltaState {
-            tip_height: 100,
+            tip_height: 100.into(),
             confirmed_block: block_ref(95, 0xcc),
-            claimable_height: 107,
+            claimable_height: 107.into(),
         }))
             .into();
         assert_eq!(
@@ -1996,6 +2049,23 @@ mod tests {
                 claimable_height: 107,
             }
         );
+
+        // bark does not re-export `ExitVtxoSweptState`, so build it from its
+        // serde form.
+        let upstream: be::ExitState = serde_json::from_value(serde_json::json!({
+            "type": "vtxo-swept",
+            "tip_height": 300,
+            "spent_inputs": [format!("{}:2", txid(0xdd))],
+        }))
+        .unwrap();
+        let swept: ExitState = (&upstream).into();
+        assert_eq!(
+            swept,
+            ExitState::VtxoSwept {
+                tip_height: 300,
+                spent_inputs: vec![OutPoint { txid: hex::encode([0xdd; 32]), vout: 2 }],
+            }
+        );
     }
 
     #[test]
@@ -2004,7 +2074,7 @@ mod tests {
         use std::collections::HashSet;
 
         let upstream = be::ExitState::Processing(be::ExitProcessingState {
-            tip_height: 5,
+            tip_height: 5.into(),
             transactions: vec![be::ExitTx {
                 txid: txid(0x01),
                 status: be::ExitTxStatus::AwaitingInputConfirmation {
@@ -2049,6 +2119,19 @@ mod tests {
             serde_json::to_value(&state).unwrap(),
             serde_json::json!({ "type": "vtxo-already-spent", "tipHeight": 3 })
         );
+
+        let state = ExitState::VtxoSwept {
+            tip_height: 4,
+            spent_inputs: vec![OutPoint { txid: "cd".into(), vout: 1 }],
+        };
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::json!({
+                "type": "vtxo-swept",
+                "tipHeight": 4,
+                "spentInputs": [{ "txid": "cd", "vout": 1 }]
+            })
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2067,10 +2150,18 @@ mod tests {
             // 2.5 sat/vB → reported as 3 sat/vB, like bark-json.
             fee_rate: FeeRate::from_sat_per_kwu(625),
             txs_to_broadcast: 3,
-            fundable: false,
         };
 
-        let local: EmergencyExitFeeEstimate = upstream.into();
+        // The deprecated `fundable` compares the onchain balance against the
+        // broadcast leg only.
+        let fundable = |balance| {
+            EmergencyExitFeeEstimate::new(upstream.clone(), balance).fundable
+        };
+        assert!(fundable(Some(Amount::from_sat(4576))));
+        assert!(!fundable(Some(Amount::from_sat(4575))));
+        assert!(!fundable(None));
+
+        let local = EmergencyExitFeeEstimate::new(upstream, None);
         assert_eq!(local.exit_broadcast_fee_sats, 4576);
         assert_eq!(local.claim_fee_sats, 645);
         assert_eq!(local.total_fee_sats, 4576 + 645);

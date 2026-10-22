@@ -643,12 +643,13 @@ impl Wallet {
 
     // -- Arkoor ---------------------------------------------------------------
 
+    /// Returns the id of the movement that records the payment.
     #[wasm_bindgen(js_name = sendArkoorPayment)]
     pub async fn send_arkoor_payment(
         &self,
         arkAddress: String,
         amountSats: f64,
-    ) -> Result<(), JsError> {
+    ) -> Result<u32, JsError> {
         Ok(self.core.send_arkoor_payment(arkAddress, amountSats as u64).await?)
     }
 
@@ -661,9 +662,11 @@ impl Wallet {
         Ok(self.core.validate_arkoor_address(address).await?)
     }
 
+    /// Send `amountSats` from the offchain balance to an onchain address, as
+    /// an offboard. Returns the offboard txid and its movement id.
     #[wasm_bindgen(js_name = sendOnchain)]
-    pub async fn send_onchain(&self, address: String, amountSats: f64) -> Result<String, JsError> {
-        Ok(self.core.send_onchain(address, amountSats as u64).await?)
+    pub async fn send_onchain(&self, address: String, amountSats: f64) -> Result<Ts<OffboardResult>, JsError> {
+        Ok(self.core.send_onchain(address, amountSats as u64).await?.into_ts()?)
     }
 
     // -- History --------------------------------------------------------------
@@ -1115,20 +1118,23 @@ impl Wallet {
     /// spendable VTXO). `feeRateSatPerVb` applies to both legs; omit it to use
     /// the chain's fast rate for the broadcast leg and regular rate for the
     /// claim leg. `destination` only affects the claim transaction's weight.
+    /// `feeMargin` scales the broadcast leg (finite and non-negative; default
+    /// 1.2).
     ///
-    /// The onchain wallet is synced first so `fundable` reflects the current
-    /// confirmed balance. Already-confirmed exit transactions cost nothing.
+    /// Already-confirmed exit transactions cost nothing. The estimate never
+    /// reads the onchain wallet, so it works before the wallet holds funds.
     #[wasm_bindgen(js_name = estimateEmergencyExitFee)]
     pub async fn estimate_emergency_exit_fee(
         &self,
         vtxoIds: Vec<String>,
         feeRateSatPerVb: Option<f64>,
         destination: Option<String>,
+        feeMargin: Option<f64>,
     ) -> Result<Ts<EmergencyExitFeeEstimate>, JsError> {
         let fee_rate = feeRateSatPerVb.map(fee_rate_sat_per_vb_from_js).transpose()?;
         Ok(self
             .core
-            .estimate_emergency_exit_fee(vtxoIds, fee_rate, destination)
+            .estimate_emergency_exit_fee(vtxoIds, fee_rate, destination, feeMargin)
             .await?.into_ts()?)
     }
 

@@ -502,11 +502,13 @@ impl Wallet {
     ///
     /// An address this bark cannot deliver to (see `validateArkoorAddress`) is
     /// rejected up front, leaving the VTXOs spendable rather than cosigned.
+    ///
+    /// Returns the id of the movement that records the payment.
     pub async fn send_arkoor_payment(
         &self,
         ark_address: String,
         amount_sats: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         let core = self.core.clone();
         run_async(async move { core.send_arkoor_payment(ark_address, amount_sats).await }).await
     }
@@ -520,11 +522,13 @@ impl Wallet {
         run_async(async move { core.validate_arkoor_address(address).await }).await
     }
 
+    /// Send `amount_sats` from the offchain balance to an onchain address,
+    /// as an offboard. Returns the offboard txid and its movement id.
     pub async fn send_onchain(
         &self,
         address: String,
         amount_sats: u64,
-    ) -> Result<String, Error> {
+    ) -> Result<types::OffboardResult, Error> {
         let core = self.core.clone();
         run_async(async move { core.send_onchain(address, amount_sats).await }).await
     }
@@ -1039,20 +1043,23 @@ impl Wallet {
     /// spendable VTXO). `fee_rate_sat_per_vb` applies to both legs; omit it to
     /// use the chain's fast rate for the broadcast leg and regular rate for
     /// the claim leg. `destination` only affects the claim transaction's weight.
+    /// `fee_margin` scales the broadcast leg (finite and non-negative; default
+    /// 1.2).
     ///
-    /// The onchain wallet is synced first so `fundable` reflects the current
-    /// confirmed balance. Requires a BDK onchain wallet: callback-backed
-    /// wallets (`CustomOnchainWalletCallbacks`) cannot simulate the CPFP walk
-    /// and return an error.
+    /// The estimate never reads the onchain wallet, so it works before the
+    /// wallet holds funds and with callback wallets
+    /// (`CustomOnchainWalletCallbacks`) too.
+    #[uniffi::method(default(fee_margin = None))]
     pub async fn estimate_emergency_exit_fee(
         &self,
         vtxo_ids: Vec<String>,
         fee_rate_sat_per_vb: Option<u64>,
         destination: Option<String>,
+        fee_margin: Option<f64>,
     ) -> Result<types::EmergencyExitFeeEstimate, Error> {
         let core = self.core.clone();
         run_async(async move {
-            core.estimate_emergency_exit_fee(vtxo_ids, fee_rate_sat_per_vb, destination).await
+            core.estimate_emergency_exit_fee(vtxo_ids, fee_rate_sat_per_vb, destination, fee_margin).await
         })
         .await
     }
