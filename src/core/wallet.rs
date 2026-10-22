@@ -1475,6 +1475,9 @@ impl Wallet {
         Ok(claimable.iter().map(Into::into).collect())
     }
 
+    /// The exits bark is still progressing. A finished exit (claimed, canceled,
+    /// or aborted because the VTXO was already spent or swept) leaves this list; use
+    /// [`Self::list_finished_exits`] or [`Self::get_exit_status`] for those.
     pub async fn get_exit_vtxos(&self) -> Result<Vec<types::ExitVtxo>, Error> {
         let exit_guard = self.inner.exit_mgr();
         Ok(exit_guard
@@ -1483,6 +1486,53 @@ impl Wallet {
             .iter()
             .map(Into::into)
             .collect())
+    }
+
+    /// Status of every exit this wallet ever started, live and finished.
+    pub async fn list_all_exits(
+        &self,
+        include_history: bool,
+        include_transactions: bool,
+    ) -> Result<Vec<types::ExitTransactionStatus>, Error> {
+        let statuses = self
+            .inner
+            .exit_mgr()
+            .list_all(include_history, include_transactions)
+            .await
+            .context("List exits failed")?;
+        Ok(statuses.into_iter().map(Into::into).collect())
+    }
+
+    /// Status of the exits that are still progressing.
+    pub async fn list_live_exits(
+        &self,
+        include_history: bool,
+        include_transactions: bool,
+    ) -> Result<Vec<types::ExitTransactionStatus>, Error> {
+        let statuses = self
+            .inner
+            .exit_mgr()
+            .list_live(include_history, include_transactions)
+            .await
+            .context("List live exits failed")?;
+        Ok(statuses.into_iter().map(Into::into).collect())
+    }
+
+    /// Status of the exits in a terminal state: claimed, canceled, or aborted
+    /// because the VTXO was already spent or swept. These stay on disk, so a client can
+    /// show which transactions and fees an exit involved after the fact.
+    pub async fn list_finished_exits(
+        &self,
+        include_history: bool,
+        include_transactions: bool,
+    ) -> Result<Vec<types::ExitTransactionStatus>, Error> {
+        let statuses = self
+            .inner
+            .exit_mgr()
+            .list_finished(include_history, include_transactions)
+            .await
+            .context("List finished exits failed")?;
+        Ok(statuses.into_iter().map(Into::into).collect())
     }
 
     pub async fn has_pending_exits(&self) -> Result<bool, Error> {
@@ -1502,6 +1552,8 @@ impl Wallet {
         Ok(exit_guard.all_claimable_at_height().await.map(|h| h.to_u32()))
     }
 
+    /// Status of one exit, live or finished. `None` if no exit was ever
+    /// started for the VTXO.
     pub async fn get_exit_status(
         &self,
         vtxo_id: String,
@@ -1565,6 +1617,18 @@ impl Wallet {
             return Err(anyhow::anyhow!("No claimable exits found").into());
         }
 
+        // Report what the PSBT really spends. An id can stop being claimable
+        // between `list_claimable_exits` and this call, so the caller must not
+        // assume every requested id made it in. Compare parsed ids, so an id
+        // spelled differently from bark's canonical form is not misreported.
+        let drained: Vec<VtxoId> = to_drain.iter().map(|ev| ev.id()).collect();
+        let skipped_vtxo_ids: Vec<String> = parse_vtxo_ids(&vtxo_ids)?
+            .into_iter()
+            .filter(|id| !drained.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+        let drained_ids: Vec<String> = drained.iter().map(|id| id.to_string()).collect();
+
         let psbt = exit_guard
             .drain_exits(&to_drain, &self.inner, addr, fee_rate)
             .await
@@ -1584,6 +1648,8 @@ impl Wallet {
         Ok(types::ExitClaimTransaction {
             psbt_base64,
             fee_sats: fee_sats.to_sat(),
+            vtxo_ids: drained_ids,
+            skipped_vtxo_ids,
         })
     }
 

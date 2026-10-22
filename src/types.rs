@@ -531,6 +531,12 @@ impl From<bark::actions::lightning::receive::LightningReceiveState> for Lightnin
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct LightningSend {
     pub invoice: String,
+    /// Payment hash of the invoice being paid. Poll `lightning_send_state`
+    /// with it; for BOLT12 there is no invoice string to parse it from.
+    pub payment_hash: String,
+    /// Id of the `Movement` that records this send. `None` only for sends
+    /// checkpointed by a bark version that predates the field.
+    pub movement_id: Option<u32>,
     /// Amount being paid, in sats (`payment_amount`).
     pub amount_sats: u64,
     /// Routing/ark fee for the send, in sats.
@@ -545,6 +551,8 @@ pub struct LightningSend {
 impl From<bark::actions::lightning::pay::LightningSend> for LightningSend {
     fn from(s: bark::actions::lightning::pay::LightningSend) -> Self {
         Self {
+            payment_hash: s.invoice.payment_hash().to_string(),
+            movement_id: s.movement_id.map(|m| m.0),
             invoice: s.invoice.to_string(),
             amount_sats: s.payment_amount.to_sat(),
             fee_sats: s.fee.to_sat(),
@@ -918,6 +926,8 @@ pub struct PendingBoard {
     pub vtxo_id: String,
     pub amount_sats: u64,
     pub txid: String,
+    /// Id of the `Movement` that records this board.
+    pub movement_id: u32,
 }
 
 impl From<BarkPendingBoard> for PendingBoard {
@@ -926,6 +936,7 @@ impl From<BarkPendingBoard> for PendingBoard {
             vtxo_id: pb.vtxos.first().map(|v| v.to_string()).unwrap_or_default(),
             amount_sats: pb.amount.to_sat(),
             txid: pb.funding_tx.compute_txid().to_string(),
+            movement_id: pb.movement_id.0,
         }
     }
 }
@@ -1542,9 +1553,73 @@ impl From<BarkExitProgressStatus> for ExitProgressStatus {
 pub struct ExitClaimTransaction {
     pub psbt_base64: String,
     pub fee_sats: u64,
+    /// The exits the PSBT actually spends. Link the claim transaction to
+    /// these, not to the ids you asked for.
+    pub vtxo_ids: Vec<String>,
+    /// Requested ids that were left out because they were not claimable when
+    /// the PSBT was built. Empty when draining all claimable exits.
+    pub skipped_vtxo_ids: Vec<String>,
+}
+
+/// The CPFP child of an exit transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ExitChildTransaction {
+    pub txid: String,
+    pub tx_hex: String,
+    /// Who created the child. Only a `Wallet` child was paid for by this
+    /// wallet, which is what fee attribution needs.
+    pub origin: ExitTxOrigin,
+    /// Effective fee rate of the child and its unconfirmed ancestors, in
+    /// sat/kwu. `None` until the mempool has been queried for it.
+    pub fee_rate_sat_per_kwu: Option<u64>,
+    /// Fee of the child plus the fees of its unconfirmed ancestors. `None`
+    /// until the mempool has been queried for it.
+    pub total_fee_sats: Option<u64>,
+}
+
+/// One transaction of an exit: the exit transaction itself and, once it was
+/// fee-bumped, the child that confirms it. A unilateral exit is a chain of
+/// these, root first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ExitTransactionPackage {
+    pub exit_txid: String,
+    pub exit_tx_hex: String,
+    pub child: Option<ExitChildTransaction>,
+}
+
+impl From<bark::exit::ExitTransactionPackage> for ExitTransactionPackage {
+    fn from(p: bark::exit::ExitTransactionPackage) -> Self {
+        use bitcoin::consensus::encode::serialize_hex;
+        Self {
+            exit_txid: p.exit.txid.to_string(),
+            exit_tx_hex: serialize_hex(&p.exit.tx),
+            child: p.child.map(|c| ExitChildTransaction {
+                txid: c.info.txid.to_string(),
+                tx_hex: serialize_hex(&c.info.tx),
+                origin: (&c.origin).into(),
+                fee_rate_sat_per_kwu: c.fee_info.map(|f| f.fee_rate.to_sat_per_kwu()),
+                total_fee_sats: c.fee_info.map(|f| f.total_fee.to_sat()),
+            }),
+        }
+    }
 }
 
 /// Detailed status of an exit transaction
+///
+/// Returned for live and finished exits alike by `get_exit_status`,
+/// `list_all_exits`, `list_live_exits` and `list_finished_exits`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "wasm-web",
@@ -1556,7 +1631,11 @@ pub struct ExitTransactionStatus {
     pub vtxo_id: String,
     pub state: ExitState,
     pub history: Option<Vec<ExitState>>,
+    /// Same as `transactions.len()`. Kept for callers that only want the count.
     pub transaction_count: u32,
+    /// The exit transaction chain, root first. Empty unless the status was
+    /// requested with `include_transactions`.
+    pub transactions: Vec<ExitTransactionPackage>,
 }
 
 impl From<bark::exit::ExitTransactionStatus> for ExitTransactionStatus {
@@ -1568,6 +1647,7 @@ impl From<bark::exit::ExitTransactionStatus> for ExitTransactionStatus {
                 .history
                 .map(|h| h.iter().map(Into::into).collect()),
             transaction_count: ets.transactions.len() as u32,
+            transactions: ets.transactions.into_iter().map(Into::into).collect(),
         }
     }
 }
