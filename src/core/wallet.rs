@@ -35,7 +35,7 @@ pub struct Wallet {
 pub struct OpenArgs {
     pub run_daemon: bool,
     #[cfg(feature = "uniffi")]
-    pub datadir: Option<String>,
+    pub datadir: Option<std::path::PathBuf>,
     pub persister: Option<Arc<dyn BarkPersister>>,
     #[cfg(not(feature = "wasm-web"))]
     pub lock_manager: Option<Box<dyn bark::lock_manager::LockManager>>,
@@ -53,7 +53,7 @@ impl OpenArgs {
             run_daemon: self.run_daemon,
 
             #[cfg(feature = "uniffi")]
-            datadir: self.datadir.map(|s| s.into()),
+            datadir: self.datadir,
             #[cfg(not(feature = "uniffi"))]
             datadir: None,
 
@@ -2514,7 +2514,6 @@ mod tests {
                     .join(format!("bark-ffi-test-{}-{}", name, std::process::id())),
             );
             let _ = std::fs::remove_dir_all(&datadir.0);
-            let datadir_str = datadir.0.to_str().unwrap().to_owned();
 
             let mut config = minimal_config();
             // Nothing listens on port 1, so every Ark server call fails fast.
@@ -2528,8 +2527,8 @@ mod tests {
                 config,
                 OpenArgs {
                     run_daemon: false,
-                    persister: Some(crate::muniffi::db::open_sqlite_db(&datadir_str).unwrap()),
-                    datadir: Some(datadir_str),
+                    persister: Some(crate::muniffi::db::open_sqlite_db(&datadir.0).unwrap()),
+                    datadir: Some(datadir.0.clone()),
                     lock_manager: None,
                     onchain: None,
                     create_if_not_exists: true,
@@ -2541,6 +2540,66 @@ mod tests {
             .unwrap_or_else(|e| panic!("offline wallet did not open: {}", e.message()));
             Self { wallet, _datadir: datadir }
         }
+    }
+
+    /// The FFI `Wallet::open` takes a `file://` URI, as Expo's
+    /// `Directory.uri` hands out, and lands on the same wallet as the plain
+    /// path: same database, same lock.
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn ffi_open_by_path_and_by_file_uri_reach_the_same_wallet() {
+        use crate::muniffi::wallet::{Wallet as FfiWallet, WalletOpenArgs};
+
+        // The space comes out as %20 in the URI, so a missing decode would
+        // open a different directory.
+        let datadir = TempDatadir(
+            std::env::temp_dir()
+                .join(format!("bark-ffi-test-uri datadir-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&datadir.0);
+        let path = datadir.0.to_str().unwrap().to_owned();
+        let uri = ::url::Url::from_directory_path(&datadir.0).unwrap().to_string();
+        assert!(uri.starts_with("file:///") && uri.contains("%20"), "{}", uri);
+
+        let mut config = minimal_config();
+        config.server_address = "http://127.0.0.1:1".to_owned();
+        config.esplora_address = Some(stub_esplora());
+        // Not the OfflineWallet seed: bark serializes creates per seed
+        // process-wide, so sharing it would slow the other tests' opens.
+        let open = |datadir: &str, create_if_not_exists: bool| FfiWallet::open(
+            Network::Regtest,
+            "legal winner thank year wave sausage worth \
+             useful legal winner thank yellow".to_owned(),
+            config.clone(),
+            WalletOpenArgs {
+                run_daemon: false,
+                datadir: datadir.to_owned(),
+                onchain: None,
+                create_if_not_exists,
+                create_without_server: true,
+                skip_recovery: true,
+            },
+        );
+
+        let created = open(&uri, true).await
+            .unwrap_or_else(|e| panic!("open by URI did not create: {}", e.message()));
+        let fingerprint = created.fingerprint();
+        drop(created);
+        assert!(datadir.0.join(bark::persist::sqlite::DEFAULT_DB_FILE).is_file());
+
+        // Without create_if_not_exists, only the wallet the URI made can open.
+        let by_path = open(&path, false).await
+            .unwrap_or_else(|e| panic!("open by path missed the wallet: {}", e.message()));
+        assert_eq!(by_path.fingerprint(), fingerprint);
+
+        // Same datadir, same lock: a second open by URI must be refused.
+        let err = open(&uri, false).await.err().expect("datadir opened twice");
+        assert!(err.message().contains("already"), "{}", err.message());
+        drop(by_path);
+
+        let by_uri = open(&uri, false).await
+            .unwrap_or_else(|e| panic!("reopen by URI failed: {}", e.message()));
+        assert_eq!(by_uri.fingerprint(), fingerprint);
     }
 
     /// A URI this wallet builds parses back to what went in. Only the onchain

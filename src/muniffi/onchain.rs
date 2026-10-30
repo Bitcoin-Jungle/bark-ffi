@@ -11,7 +11,7 @@ use crate::types::OnchainBalance;
 use crate::muniffi::custom_onchain_wallet::{
     CallbackWalletAdapter, CustomOnchainWalletCallbacks,
 };
-use crate::muniffi::db::open_sqlite_db;
+use crate::muniffi::db::{open_sqlite_db, resolve_datadir};
 use crate::muniffi::runtime::run_async;
 use crate::Network;
 
@@ -31,7 +31,8 @@ enum OnchainWalletInner {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl OnchainWallet {
-    /// BDK-backed wallet. Opens the shared sqlite cache.
+    /// BDK-backed wallet. Opens the shared sqlite cache in `datadir`, a
+    /// filesystem path or a `file://` URI.
     #[uniffi::constructor]
     pub async fn default(
         network: Network,
@@ -40,7 +41,7 @@ impl OnchainWallet {
         datadir: String,
     ) -> Result<Arc<Self>, Error> {
         run_async(async move {
-            let db = open_sqlite_db(&datadir)?;
+            let db = open_sqlite_db(&resolve_datadir(&datadir)?)?;
             let core = CoreOnchainWallet::default(network, mnemonic, config, db).await?;
             Ok(Arc::new(Self { inner: OnchainWalletInner::Bdk(Arc::new(core)) }))
         })

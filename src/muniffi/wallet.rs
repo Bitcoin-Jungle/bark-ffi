@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::core::notification::NotificationHolder;
 use crate::core::wallet::{Wallet as CoreWallet, OpenArgs as CoreOpenArgs};
 use crate::types::Network;
-use crate::muniffi::db::open_sqlite_db;
+use crate::muniffi::db::{open_sqlite_db, resolve_datadir};
 use crate::muniffi::onchain::OnchainWallet;
 use crate::muniffi::runtime::run_async;
 
@@ -24,7 +24,8 @@ pub struct WalletOpenArgs {
     #[uniffi(default = true)]
     pub run_daemon: bool,
 
-    /// The data directory to use for this wallet
+    /// The data directory to use for this wallet: a filesystem path or a
+    /// `file://` URI (such as Expo's `Directory.uri`)
     pub datadir: String,
 
     /// The onchain wallet to use, if any
@@ -82,6 +83,8 @@ impl Wallet {
 /// Low-level function to initialize a wallet
 ///
 /// You probably want to use [`Wallet::open`] instead.
+///
+/// `datadir` is a filesystem path or a `file://` URI.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn init_wallet(
     network: Network,
@@ -91,8 +94,9 @@ pub async fn init_wallet(
     allow_unreachable_server: bool,
 ) -> Result<(), Error> {
     run_async(async move {
+        let datadir = resolve_datadir(&datadir)?;
         let db = open_sqlite_db(&datadir)
-            .with_context(|| format!("opening sqlite in {}", datadir))?;
+            .with_context(|| format!("opening sqlite in {}", datadir.display()))?;
         let lock_manager = bark::lock_manager::platform_default(Some(&datadir), None)?;
         CoreWallet::create(
             network, mnemonic_or_seed, config, &*db, &*lock_manager, allow_unreachable_server,
@@ -123,9 +127,10 @@ impl Wallet {
         args: WalletOpenArgs,
     ) -> Result<Arc<Self>, Error> {
         run_async(async move {
+            let datadir = resolve_datadir(&args.datadir)?;
             let core = CoreWallet::open(network, mnemonic_or_seed, config, CoreOpenArgs {
-                persister: Some(open_sqlite_db(&args.datadir)?),
-                datadir: Some(args.datadir),
+                persister: Some(open_sqlite_db(&datadir)?),
+                datadir: Some(datadir),
                 lock_manager: None,
                 onchain: args.onchain.map(|w| w.inner_dyn()),
                 run_daemon: args.run_daemon,
