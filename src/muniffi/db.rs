@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{anyhow, bail, Context};
 use log::{info, warn};
 use rusqlite::{OpenFlags, OptionalExtension};
 
@@ -27,6 +27,50 @@ pub struct DatadirInfo {
     pub fingerprint: String,
 }
 
+/// The directory a `datadir` argument names.
+///
+/// Takes a filesystem path, returned unchanged, or a `file://` URI such as
+/// Expo's `Directory.uri`, which is percent-decoded into its path. Any other
+/// URI scheme (an Android `content://` URI, say) is an error: the wallet needs
+/// a real directory for its database and lock file.
+pub(crate) fn resolve_datadir(datadir: &str) -> anyhow::Result<PathBuf> {
+    let Some(scheme) = uri_scheme(datadir) else {
+        return Ok(PathBuf::from(datadir));
+    };
+    if !scheme.eq_ignore_ascii_case("file") {
+        bail!(
+            "unsupported datadir URI scheme \"{}\": pass a filesystem path or a file:// URI",
+            scheme,
+        );
+    }
+    let url = url::Url::parse(datadir)
+        .with_context(|| format!("invalid datadir URI {}", datadir))?;
+    // An unencoded `?` or `#` in a directory name starts a query or fragment,
+    // which `to_file_path` drops, so the path would silently come out short.
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!(
+            "datadir URI {} has a query or fragment; percent-encode any '?' or '#' in the path",
+            datadir,
+        );
+    }
+    url.to_file_path()
+        .map_err(|()| anyhow!("datadir URI {} does not name a local path", datadir))
+}
+
+/// The scheme of `s` if it starts like a URI (`<scheme>:/`).
+///
+/// A one-letter scheme is a Windows drive letter (`C:/wallet`), and a colon
+/// without a slash after it is part of a relative file name (`bark:1`), so
+/// neither makes `s` a URI.
+fn uri_scheme(s: &str) -> Option<&str> {
+    let (scheme, rest) = s.split_once(':')?;
+    let mut chars = scheme.chars();
+    let is_scheme = scheme.len() > 1
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (is_scheme && rest.starts_with('/')).then_some(scheme)
+}
+
 /// The database file an open of `datadir` would use, if one exists.
 fn existing_db_path(datadir: &Path) -> Option<PathBuf> {
     let db_path = datadir.join(DEFAULT_DB_FILE);
@@ -41,6 +85,8 @@ fn existing_db_path(datadir: &Path) -> Option<PathBuf> {
 }
 
 /// Whether `datadir` holds an initialized bark wallet.
+///
+/// `datadir` is a filesystem path or a `file://` URI.
 ///
 /// Answers without side effects: the database is opened read-only, no
 /// migration runs and no file or directory is created. Returns `false` for a
@@ -61,7 +107,8 @@ pub fn wallet_exists(datadir: String) -> Result<bool, Error> {
 /// which collides with the record of the same name.
 #[uniffi::export]
 pub fn read_datadir_info(datadir: String) -> Result<Option<DatadirInfo>, Error> {
-    let Some(db_path) = existing_db_path(Path::new(&datadir)) else {
+    let datadir = resolve_datadir(&datadir)?;
+    let Some(db_path) = existing_db_path(&datadir) else {
         return Ok(None);
     };
     Ok(read_wallet_properties(&db_path)?)
@@ -109,16 +156,15 @@ fn read_wallet_properties(db_path: &Path) -> anyhow::Result<Option<DatadirInfo>>
 ///
 /// # Arguments
 ///
-/// * `datadir` - The directory containing the wallet data
+/// * `datadir_path` - The directory containing the wallet data, already resolved
+///   by [`resolve_datadir`]
 ///
 /// # Returns
 ///
 /// An `Arc<SqliteClient>` that can be shared across multiple wallet instances.
-pub fn open_sqlite_db(datadir: &str) -> anyhow::Result<Arc<SqliteClient>> {
-    let datadir_path = PathBuf::from(datadir);
-
+pub fn open_sqlite_db(datadir_path: &Path) -> anyhow::Result<Arc<SqliteClient>> {
     // Ensure the directory exists
-    std::fs::create_dir_all(&datadir_path)
+    std::fs::create_dir_all(datadir_path)
         .with_context(|| format!("Failed to create datadir {}", datadir_path.display(),))?;
 
     let db_path = {
@@ -216,6 +262,79 @@ mod tests {
         let info = read_datadir_info(dir.to_string_lossy().into_owned()).unwrap().unwrap();
         assert!(matches!(info.network, Network::Bitcoin));
         assert!(info.db_file.ends_with(LEGACY_DB_FILE));
+    }
+
+    #[test]
+    fn plain_datadir_paths_are_unchanged() {
+        for path in [
+            "bark",
+            "relative/bark",
+            "/data/user/0/com.example/files/bark",
+            "/path with spaces/%20literal",
+            "bark:1",
+            r"C:\Users\satoshi\bark",
+            "C:/Users/satoshi/bark",
+            r"\\server\share\bark",
+            "",
+        ] {
+            assert_eq!(resolve_datadir(path).unwrap(), PathBuf::from(path), "{}", path);
+        }
+    }
+
+    #[test]
+    fn file_uri_datadir_resolves_to_its_path() {
+        let dir = tmp_datadir("uri dir");
+        let uri = url::Url::from_directory_path(&dir).unwrap();
+        assert!(uri.as_str().contains("%20"), "{}", uri);
+        assert_eq!(resolve_datadir(uri.as_str()).unwrap(), dir);
+
+        // Without the trailing slash Expo puts on directories.
+        let uri = url::Url::from_file_path(&dir).unwrap();
+        assert_eq!(resolve_datadir(uri.as_str()).unwrap(), dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expo_style_file_uri_is_decoded() {
+        assert_eq!(
+            resolve_datadir("file:///var/mobile/Library/Application%20Support/bark%23%3F/").unwrap(),
+            PathBuf::from("/var/mobile/Library/Application Support/bark#?/"),
+        );
+        assert_eq!(
+            resolve_datadir("FILE://localhost/data/user/0/com.example/files/bark").unwrap(),
+            PathBuf::from("/data/user/0/com.example/files/bark"),
+        );
+        assert!(resolve_datadir("file://server/share/bark").is_err());
+    }
+
+    #[test]
+    fn other_uri_schemes_are_rejected() {
+        for uri in [
+            "content://com.android.externalstorage.documents/tree/primary%3Abark",
+            "https://example.com/bark",
+            "foo:/bark",
+        ] {
+            let err = resolve_datadir(uri).unwrap_err().to_string();
+            assert!(err.contains("unsupported datadir URI scheme"), "{}: {}", uri, err);
+        }
+    }
+
+    #[test]
+    fn file_uri_with_query_or_fragment_is_rejected() {
+        for uri in ["file:///tmp/my#wallet", "file:///tmp/my?wallet"] {
+            assert!(resolve_datadir(uri).is_err(), "{}", uri);
+        }
+    }
+
+    #[test]
+    fn wallet_found_by_path_is_found_by_file_uri() {
+        let dir = tmp_datadir("uri wallet");
+        write_properties(&dir.join(DEFAULT_DB_FILE), "signet", "deadbeef");
+        let uri = url::Url::from_directory_path(&dir).unwrap().to_string();
+        assert!(wallet_exists(uri.clone()).unwrap());
+        let info = read_datadir_info(uri).unwrap().unwrap();
+        assert_eq!(info.fingerprint, "deadbeef");
+        assert_eq!(PathBuf::from(info.db_file), dir.join(DEFAULT_DB_FILE));
     }
 
     #[test]
