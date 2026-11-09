@@ -1652,6 +1652,314 @@ impl From<bark::exit::ExitTransactionStatus> for ExitTransactionStatus {
     }
 }
 
+/// A transaction of an exit chain, mirroring `bark::exit::TransactionInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ExitTransactionInfo {
+    pub txid: String,
+    /// Consensus-encoded transaction, hex.
+    pub tx_hex: String,
+}
+
+impl From<bark::exit::TransactionInfo> for ExitTransactionInfo {
+    fn from(t: bark::exit::TransactionInfo) -> Self {
+        Self {
+            txid: t.txid.to_string(),
+            tx_hex: bitcoin::consensus::encode::serialize_hex(&t.tx),
+        }
+    }
+}
+
+/// Fee a transaction commits together with its unconfirmed ancestors,
+/// mirroring `bark::exit::FeeInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ExitFeeInfo {
+    /// Effective fee rate, in sat/kwu (lossless; divide by 250 for sat/vB).
+    pub fee_rate_sat_per_kwu: u64,
+    /// Sum of the transaction's own fee and the fees of its unconfirmed
+    /// ancestors.
+    pub total_fee_sats: u64,
+}
+
+impl From<bark::exit::FeeInfo> for ExitFeeInfo {
+    fn from(f: bark::exit::FeeInfo) -> Self {
+        Self {
+            fee_rate_sat_per_kwu: f.fee_rate.to_sat_per_kwu(),
+            total_fee_sats: f.total_fee.to_sat(),
+        }
+    }
+}
+
+/// How much of a [`PresignedExit`]'s remaining broadcast work could be funded
+/// and signed, mirroring `bark::exit::PresignedExitStatus`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PresignedExitStatus {
+    /// Every package has a signed child. The exit's broadcast completes once
+    /// wave `exited_in_wave` (an index into [`PresignedExits::waves`])
+    /// confirms; `None` when the chain is already confirmed and there is
+    /// nothing to broadcast. `fee_info` totals the children's fees over the
+    /// combined weight of this exit's packages.
+    FullySigned {
+        exited_in_wave: Option<u32>,
+        fee_info: ExitFeeInfo,
+    },
+    /// Confirmed onchain funds ran out mid-chain: wave `last_wave` holds this
+    /// exit's last signed package and [`PresignedExit::unsigned`] continues
+    /// right after it.
+    PartiallySigned { last_wave: u32 },
+    /// No package could be funded.
+    Unsigned,
+}
+
+impl From<bark::exit::PresignedExitStatus> for PresignedExitStatus {
+    fn from(s: bark::exit::PresignedExitStatus) -> Self {
+        use bark::exit::PresignedExitStatus as B;
+        match s {
+            B::FullySigned { exited_in_wave, fee_info } => Self::FullySigned {
+                exited_in_wave: exited_in_wave.map(wave_index),
+                fee_info: fee_info.into(),
+            },
+            B::PartiallySigned { last_wave } => Self::PartiallySigned {
+                last_wave: wave_index(last_wave),
+            },
+            B::Unsigned => Self::Unsigned,
+        }
+    }
+}
+
+/// Wave indices are bounded by the number of exit transactions a wallet can
+/// hold, so they always fit; saturate rather than panic all the same.
+fn wave_index(i: usize) -> u32 {
+    u32::try_from(i).unwrap_or(u32::MAX)
+}
+
+/// A signed CPFP child and the fee it commits, mirroring
+/// `bark::exit::PresignedExitChildInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PresignedExitChild {
+    pub txid: String,
+    /// Consensus-encoded signed transaction, hex.
+    pub tx_hex: String,
+    /// The exit transaction is zero-fee, so this is the fee of the whole
+    /// package.
+    pub fee_info: ExitFeeInfo,
+}
+
+/// An `(exit, child)` transaction package, broadcast as one unit (e.g. with
+/// `submitpackage`), mirroring `bark::exit::PresignedExitPackage`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PresignedExitPackage {
+    /// The VTXO whose exit this package advances.
+    pub vtxo_id: String,
+    /// The zero-fee exit transaction.
+    pub exit: ExitTransactionInfo,
+    /// The signed CPFP child paying for `exit`.
+    pub child: PresignedExitChild,
+}
+
+impl From<bark::exit::PresignedExitPackage> for PresignedExitPackage {
+    fn from(p: bark::exit::PresignedExitPackage) -> Self {
+        Self {
+            vtxo_id: p.vtxo_id.to_string(),
+            exit: p.exit.into(),
+            child: PresignedExitChild {
+                txid: p.child.txid.to_string(),
+                tx_hex: bitcoin::consensus::encode::serialize_hex(&p.child.tx),
+                fee_info: p.child.fee_info.into(),
+            },
+        }
+    }
+}
+
+/// One step of a presigned broadcast plan, mirroring
+/// `bark::exit::PresignedWave`. See [`PresignedExits`] for the rules.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PresignedWave {
+    /// Packages funded independently of each other, broadcast together.
+    pub packages: Vec<PresignedExitPackage>,
+    /// Exit transactions already in the mempool; they confirm with this wave.
+    /// Only the first wave has any.
+    pub in_mempool: Vec<ExitTransactionInfo>,
+}
+
+impl From<bark::exit::PresignedWave> for PresignedWave {
+    fn from(w: bark::exit::PresignedWave) -> Self {
+        Self {
+            packages: w.packages.into_iter().map(Into::into).collect(),
+            in_mempool: w.in_mempool.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// The presigned broadcast work for one VTXO, mirroring
+/// `bark::exit::PresignedExit`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PresignedExit {
+    pub vtxo_id: String,
+    pub status: PresignedExitStatus,
+    /// The remaining tail of this exit's chain that could not be funded, in
+    /// broadcast order; its first transaction spends this exit's last signed
+    /// one. Empty when fully signed.
+    pub unsigned: Vec<ExitTransactionInfo>,
+}
+
+impl From<bark::exit::PresignedExit> for PresignedExit {
+    fn from(e: bark::exit::PresignedExit) -> Self {
+        Self {
+            vtxo_id: e.vtxo_id.to_string(),
+            status: e.status.into(),
+            unsigned: e.unsigned.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Presigned emergency-exit chains for a set of VTXOs: a wave-by-wave
+/// broadcast plan plus a per-VTXO summary, mirroring
+/// `bark::exit::PresignedExits`.
+///
+/// Execute the plan in wave order: broadcast all of a wave's packages
+/// together, then wait for every one, and its `in_mempool` transactions, to
+/// confirm before the next wave. Each wave's children spend change confirmed
+/// by the previous wave.
+///
+/// Presigning reserves no funds, so a later spend from the onchain wallet can
+/// invalidate the remaining children. It does reveal the change addresses
+/// those children pay to. The children are fully signed: treat the result as
+/// sensitive and store it accordingly.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PresignedExits {
+    /// One entry per requested VTXO, in request order (duplicates resolve to
+    /// their first occurrence).
+    pub exits: Vec<PresignedExit>,
+    /// The broadcast plan. Confirmed transactions are omitted, relayed ones are
+    /// listed in [`PresignedWave::in_mempool`], and a package shared by several
+    /// exits appears once, under the first exit that references it.
+    pub waves: Vec<PresignedWave>,
+}
+
+impl From<bark::exit::PresignedExits> for PresignedExits {
+    fn from(p: bark::exit::PresignedExits) -> Self {
+        Self {
+            exits: p.exits.into_iter().map(Into::into).collect(),
+            waves: p.waves.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// The exit transactions one VTXO still needs confirmed to be exited.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RemainingExit {
+    pub vtxo_id: String,
+    /// Txids in broadcast order. Each one's transaction is in
+    /// [`RemainingExitTransactions::transactions`]. Empty when the chain is
+    /// already confirmed.
+    pub txids: Vec<String>,
+}
+
+/// The exit transactions of a set of VTXOs still awaiting confirmation,
+/// mirroring `bark::exit::RemainingExitTransactions`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RemainingExitTransactions {
+    /// One entry per requested VTXO, in request order (duplicates resolve to
+    /// their first occurrence). Upstream returns a map; it is a list here so
+    /// the order is stable across bindings.
+    pub exits: Vec<RemainingExit>,
+    /// Every transaction referenced by `exits` exactly once, parents before
+    /// children.
+    pub transactions: Vec<ExitTransactionInfo>,
+}
+
+impl RemainingExitTransactions {
+    /// Converts bark's result, listing `exits` in the order of `requested`.
+    /// Ids missing from `requested` (none, in practice) follow, sorted, so
+    /// nothing upstream returned is dropped.
+    pub(crate) fn from_bark(
+        r: bark::exit::RemainingExitTransactions,
+        requested: &[ark::VtxoId],
+    ) -> Self {
+        let mut map = r.exits;
+        let mut ordered = Vec::with_capacity(map.len());
+        for id in requested {
+            if let Some(txids) = map.remove(id) {
+                ordered.push((*id, txids));
+            }
+        }
+        let mut rest: Vec<_> = map.into_iter().collect();
+        rest.sort_unstable_by_key(|(id, _)| *id);
+        ordered.extend(rest);
+
+        Self {
+            exits: ordered
+                .into_iter()
+                .map(|(id, txids)| RemainingExit {
+                    vtxo_id: id.to_string(),
+                    txids: txids.iter().map(|t| t.to_string()).collect(),
+                })
+                .collect(),
+            transactions: r.transactions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 // ============================================================================
 // Round Types
 // ============================================================================
@@ -2490,6 +2798,182 @@ mod tests {
             // rather than silently mapping to something wrong.
             let _: ExitStateKind = (*kind).into();
         }
+    }
+
+    fn tx(lock_time: u32) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::non_standard(3),
+            lock_time: bitcoin::absolute::LockTime::from_consensus(lock_time),
+            input: vec![],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(330),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn tx_info(lock_time: u32) -> bark::exit::TransactionInfo {
+        let tx = tx(lock_time);
+        bark::exit::TransactionInfo { txid: tx.compute_txid(), tx }
+    }
+
+    fn vtxo_id(byte: u8) -> ark::VtxoId {
+        ark::VtxoId::from_slice(&[byte; 36]).unwrap()
+    }
+
+    #[test]
+    fn exit_fee_info_is_lossless() {
+        let fee = bark::exit::FeeInfo {
+            fee_rate: bitcoin::FeeRate::from_sat_per_kwu(253),
+            total_fee: bitcoin::Amount::from_sat(1_234),
+        };
+        assert_eq!(
+            ExitFeeInfo::from(fee),
+            ExitFeeInfo { fee_rate_sat_per_kwu: 253, total_fee_sats: 1_234 },
+        );
+    }
+
+    #[test]
+    fn presigned_exits_conversion_carries_every_field() {
+        use bark::exit as B;
+
+        let fee = B::FeeInfo {
+            fee_rate: bitcoin::FeeRate::from_sat_per_kwu(500),
+            total_fee: bitcoin::Amount::from_sat(700),
+        };
+        let (exit, child, relayed, tail) = (tx_info(1), tx_info(2), tx_info(3), tx_info(4));
+        let upstream = B::PresignedExits {
+            exits: vec![
+                B::PresignedExit {
+                    vtxo_id: vtxo_id(1),
+                    status: B::PresignedExitStatus::FullySigned { exited_in_wave: Some(0), fee_info: fee },
+                    unsigned: vec![],
+                },
+                B::PresignedExit {
+                    vtxo_id: vtxo_id(2),
+                    status: B::PresignedExitStatus::PartiallySigned { last_wave: 3 },
+                    unsigned: vec![tail.clone()],
+                },
+                B::PresignedExit {
+                    vtxo_id: vtxo_id(3),
+                    status: B::PresignedExitStatus::Unsigned,
+                    unsigned: vec![],
+                },
+                B::PresignedExit {
+                    vtxo_id: vtxo_id(4),
+                    status: B::PresignedExitStatus::FullySigned { exited_in_wave: None, fee_info: fee },
+                    unsigned: vec![],
+                },
+            ],
+            waves: vec![B::PresignedWave {
+                packages: vec![B::PresignedExitPackage {
+                    vtxo_id: vtxo_id(1),
+                    exit: exit.clone(),
+                    child: B::PresignedExitChildInfo {
+                        txid: child.txid,
+                        tx: child.tx.clone(),
+                        fee_info: fee,
+                    },
+                }],
+                in_mempool: vec![relayed.clone()],
+            }],
+        };
+
+        let ffi_fee = ExitFeeInfo { fee_rate_sat_per_kwu: 500, total_fee_sats: 700 };
+        let hex = |t: &B::TransactionInfo| bitcoin::consensus::encode::serialize_hex(&t.tx);
+        let info = |t: &B::TransactionInfo| ExitTransactionInfo {
+            txid: t.txid.to_string(),
+            tx_hex: hex(t),
+        };
+
+        let got = PresignedExits::from(upstream);
+        assert_eq!(got.exits, vec![
+            PresignedExit {
+                vtxo_id: vtxo_id(1).to_string(),
+                status: PresignedExitStatus::FullySigned { exited_in_wave: Some(0), fee_info: ffi_fee.clone() },
+                unsigned: vec![],
+            },
+            PresignedExit {
+                vtxo_id: vtxo_id(2).to_string(),
+                status: PresignedExitStatus::PartiallySigned { last_wave: 3 },
+                unsigned: vec![info(&tail)],
+            },
+            PresignedExit {
+                vtxo_id: vtxo_id(3).to_string(),
+                status: PresignedExitStatus::Unsigned,
+                unsigned: vec![],
+            },
+            PresignedExit {
+                vtxo_id: vtxo_id(4).to_string(),
+                status: PresignedExitStatus::FullySigned { exited_in_wave: None, fee_info: ffi_fee.clone() },
+                unsigned: vec![],
+            },
+        ]);
+        assert_eq!(got.waves, vec![PresignedWave {
+            packages: vec![PresignedExitPackage {
+                vtxo_id: vtxo_id(1).to_string(),
+                exit: info(&exit),
+                child: PresignedExitChild {
+                    txid: child.txid.to_string(),
+                    tx_hex: hex(&child),
+                    fee_info: ffi_fee,
+                },
+            }],
+            in_mempool: vec![info(&relayed)],
+        }]);
+
+        // The hex is the consensus encoding, so it decodes back to the txid.
+        let decoded: bitcoin::Transaction = bitcoin::consensus::encode::deserialize_hex(
+            &got.waves[0].packages[0].child.tx_hex,
+        ).unwrap();
+        assert_eq!(decoded.compute_txid(), child.txid);
+    }
+
+    #[test]
+    fn presigned_exit_status_serde_tags() {
+        let fee = ExitFeeInfo { fee_rate_sat_per_kwu: 1, total_fee_sats: 2 };
+        let v = serde_json::to_value(PresignedExitStatus::FullySigned {
+            exited_in_wave: Some(1),
+            fee_info: fee,
+        }).unwrap();
+        assert_eq!(v["type"], serde_json::json!("fully-signed"));
+        assert_eq!(v["exitedInWave"], serde_json::json!(1));
+        // Record fields are camelCased only for wasm-web, like every record.
+        assert!(v["feeInfo"].is_object(), "{v}");
+
+        let v = serde_json::to_value(PresignedExitStatus::PartiallySigned { last_wave: 2 }).unwrap();
+        assert_eq!(v["type"], serde_json::json!("partially-signed"));
+        assert_eq!(v["lastWave"], serde_json::json!(2));
+
+        let v = serde_json::to_value(PresignedExitStatus::Unsigned).unwrap();
+        assert_eq!(v["type"], serde_json::json!("unsigned"));
+    }
+
+    /// Upstream returns a map; the FFI list follows the request order,
+    /// skipping duplicates, and keeps anything the request did not name.
+    #[test]
+    fn remaining_exit_transactions_follow_request_order() {
+        let (a, b, c) = (tx_info(1), tx_info(2), tx_info(3));
+        let upstream = bark::exit::RemainingExitTransactions {
+            exits: [
+                (vtxo_id(1), vec![a.txid]),
+                (vtxo_id(2), vec![a.txid, b.txid]),
+                (vtxo_id(3), vec![]),
+                (vtxo_id(9), vec![c.txid]),
+                (vtxo_id(8), vec![]),
+            ].into_iter().collect(),
+            transactions: vec![a.clone(), b.clone(), c.clone()],
+        };
+
+        let requested = [vtxo_id(3), vtxo_id(1), vtxo_id(3), vtxo_id(2)];
+        let got = RemainingExitTransactions::from_bark(upstream, &requested);
+
+        let order: Vec<_> = got.exits.iter().map(|e| e.vtxo_id.clone()).collect();
+        assert_eq!(order, [3, 1, 2, 8, 9].map(|b| vtxo_id(b).to_string()));
+        assert_eq!(got.exits[2].txids, vec![a.txid.to_string(), b.txid.to_string()]);
+        assert!(got.exits[0].txids.is_empty());
+        let txids: Vec<_> = got.transactions.iter().map(|t| t.txid.clone()).collect();
+        assert_eq!(txids, [&a, &b, &c].map(|t| t.txid.to_string()));
     }
 
     #[test]

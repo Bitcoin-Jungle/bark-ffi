@@ -57,8 +57,8 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "ark-lib"
-version = "0.8.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+version = "0.8.1"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
  "async-trait",
  "bark-bitcoin-ext",
@@ -168,8 +168,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bark-bitcoin-ext"
-version = "0.8.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+version = "0.8.1"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
  "bdk_bitcoind_rpc",
  "bdk_wallet",
@@ -185,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "bark-common"
-version = "0.8.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+version = "0.8.1"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
  "anyhow",
  "serde",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "bark-ffi"
-version = "0.30.1+bark-0.8.0.uniffi-0.31.1"
+version = "0.31.0+bark-0.8.1.uniffi-0.31.2"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -226,8 +226,8 @@ dependencies = [
 
 [[package]]
 name = "bark-runtime"
-version = "0.8.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+version = "0.8.1"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
  "futures",
  "gloo-timers",
@@ -239,8 +239,8 @@ dependencies = [
 
 [[package]]
 name = "bark-server-rpc"
-version = "0.8.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+version = "0.8.1"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
  "ark-lib",
  "bitcoin",
@@ -259,8 +259,8 @@ dependencies = [
 
 [[package]]
 name = "bark-wallet"
-version = "0.8.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+version = "0.8.1"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -368,6 +368,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bdk_coin_select"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43064fa3dd1d3a8b24079cfcb5ede6b785857edc782277f17a1736511ccc1916"
+
+[[package]]
 name = "bdk_core"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -391,12 +397,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "bdk_wallet"
-version = "3.1.0"
+name = "bdk_tx"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1284fb23acc3e3022673712b55f4d5ce7e38aadc2c49bbef830dc3935f0a3289"
+checksum = "40406c9952f15ed30893826bd83b7d67b6bf11d56574c1efc3db3a5d70cdfcea"
+dependencies = [
+ "bdk_coin_select",
+ "miniscript",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "bdk_wallet"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "163ec032e0a5a795ded2a7e47fc40a887c75743326483147e4465159c53abdc4"
 dependencies = [
  "bdk_chain",
+ "bdk_tx",
  "bitcoin",
  "miniscript",
  "rand_core 0.6.4",
@@ -413,9 +432,8 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "bip321"
 version = "0.4.0"
-source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.0#959a489ff4934b181783b41c7d3ee68d85b95cbf"
+source = "git+https://gitlab.com/ark-bitcoin/bark?rev=bark-0.8.1#303682063ed7559b06dcf37c5cb37bb7037b943f"
 dependencies = [
- "bark-bitcoin-ext",
  "bitcoin",
  "lightning",
  "lightning-invoice",
@@ -609,8 +627,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
 dependencies = [
  "find-msvc-tools",
- "jobserver",
- "libc",
  "shlex",
 ]
 
@@ -1552,16 +1568,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "jobserver"
-version = "0.1.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
-dependencies = [
- "getrandom 0.4.3",
- "libc",
-]
 
 [[package]]
 name = "js-sys"
@@ -2863,7 +2869,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3086,7 +3092,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "webpki-roots",
- "zstd",
 ]
 
 [[package]]
@@ -3317,9 +3322,9 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "uniffi"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc5f2297ee5b893405bed1a6929faec4713a061df158ecf5198089f23910d470"
+checksum = "46eefd5468602930da46b1f49d3448c6dfc2e81295f93120f23f8174fd70267f"
 dependencies = [
  "anyhow",
  "camino",
@@ -3333,9 +3338,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_bindgen"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bc0c60a9607e7ab77a2ad47ec5530178015014839db25af7512447d2238016c"
+checksum = "c4a0c9b375d32e1365cdb2bdd7cb495eecf6fac851ddbad077412b4ee1888514"
 dependencies = [
  "anyhow",
  "askama",
@@ -3359,9 +3364,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_core"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77baf5d539fe2e1ad6805e942dbc5dbdeb2b83eb5f2b3a6535d422ca4b02a12f"
+checksum = "eec017b112701681f6fbbe5d92014b5c468eb0b177a94389de03ceec40665095"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -3372,9 +3377,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_internal_macros"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4b42137524f4be6400fcaca9d02c1d4ecb6ad917e4013c0b93235526d8396e5"
+checksum = "4641669b48fefbc5e80ff08c5004d9c7617fb91232131a6734ab6712779cb04c"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -3385,9 +3390,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_macros"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9273ec45330d8fe9a3701b7b983cea7a4e218503359831967cb95d26b873561"
+checksum = "eeb8617ee814de22caf7417bf514715ba0b3f46bd9d5a5d794413fd8282cb737"
 dependencies = [
  "camino",
  "fs-err",
@@ -3402,9 +3407,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_meta"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "431d2f443e7828a6c29d188de98b6771a6491ee98bba2d4372643bf93f988a18"
+checksum = "58d5b94fc92803d21b2928bd15c6f06e57609b95caf98ea561c99cda1b6d2a25"
 dependencies = [
  "anyhow",
  "siphasher",
@@ -3414,9 +3419,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_pipeline"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "761ef74f6175e15603d0424cc5f98854c5baccfe7bf4ccb08e5816f9ab8af689"
+checksum = "032739b3ec725576914c15899dedaf080163ced86b6934566c20ec2b20ce90ca"
 dependencies = [
  "anyhow",
  "heck",
@@ -3427,9 +3432,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_udl"
-version = "0.31.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68773ec0e1c067b6505a73bbf6a5782f31a7f9209333a0df97b87565c46bf370"
+checksum = "fc0a1d0a0252ce1af9e8ce78ba67ac0d8937fb2bedaf10cbddd43d3614d06ec6"
 dependencies = [
  "anyhow",
  "textwrap",
@@ -3930,31 +3935,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zstd"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "8.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.1.2+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
-dependencies = [
- "cc",
- "pkg-config",
-]
