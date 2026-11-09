@@ -24,8 +24,8 @@ For the actual bindings, go to [bark-ffi-bindings](https://gitlab.com/ark-bitcoi
 This repo can maintain different branches with different versions of uniffi, for example:
 
 ```
-v0.30.1+bark-0.8.0.uniffi-0.31.1
-v0.30.1+bark-0.8.0.uniffi-0.30.0
+v0.31.0+bark-0.8.1.uniffi-0.31.2
+v0.31.0+bark-0.8.1.uniffi-0.30.0
 ```
 
 Bindings from [bark-ffi-bindings](https://gitlab.com/ark-bitcoin/bark-ffi-bindings) can tap into these branches to generate their own bindings:
@@ -34,8 +34,8 @@ Bindings from [bark-ffi-bindings](https://gitlab.com/ark-bitcoin/bark-ffi-bindin
 # react-native/rust/Cargo.toml
 
 [dependencies]
-bark-ffi = { git = "https://gitlab.com/ark-bitcoin/bark-ffi", tag = "v0.30.1+bark-0.8.0.uniffi-0.31.1" }
-uniffi = { version = "=0.31.1", features = ["cli"] }
+bark-ffi = { git = "https://gitlab.com/ark-bitcoin/bark-ffi", tag = "v0.31.0+bark-0.8.1.uniffi-0.31.2" }
+uniffi = { version = "=0.31.2", features = ["cli"] }
 ```
 
 ## Build flavors

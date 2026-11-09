@@ -18,8 +18,8 @@ use crate::types::{
     ExitClaimTransaction, ExitProgressStatus, ExitTransactionStatus, ExitVtxo, FeeEstimate,
     ImportVtxoArgs, LightningInvoice, LightningReceive, LightningSend, LightningSendStatus,
     Movement, Network, OffboardResult, PaymentMethod, PaymentRequest, PaymentResult,
-    PendingBoard, RecoveryReport, RecoveryStatus, RoundState, Vtxo, VtxoLockHolder,
-    WalletProperties,
+    PendingBoard, PresignedExits, RecoveryReport, RecoveryStatus, RemainingExitTransactions,
+    RoundState, Vtxo, VtxoLockHolder, WalletProperties,
 };
 use crate::wasm::db::indexed_db_client;
 use crate::wasm::notification::NotificationHolder;
@@ -132,6 +132,11 @@ pub struct Bolt11InvoiceArgs {
     pub description: Option<String>,
     #[tsify(optional)]
     pub token: Option<String>,
+    /// Seconds the invoice can be paid for. Defaults to, and cannot exceed,
+    /// the Ark server's invoice expiry; creating the invoice fails if the
+    /// server does not honour it. Must be at least 1.
+    #[tsify(optional)]
+    pub expirySecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -144,6 +149,9 @@ pub struct Bolt11InvoiceForAddressArgs {
     pub description: Option<String>,
     #[tsify(optional)]
     pub token: Option<String>,
+    /// Works as in [`Bolt11InvoiceArgs::expirySecs`].
+    #[tsify(optional)]
+    pub expirySecs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -210,6 +218,27 @@ pub struct ListExitsArgs {
     pub includeHistory: Option<bool>,
     #[tsify(optional)]
     pub includeTransactions: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct PresignEmergencyExitArgs {
+    /// VTXOs to presign. Omit for every spendable VTXO; an empty list
+    /// presigns nothing.
+    #[tsify(optional)]
+    pub vtxoIds: Option<Vec<String>>,
+    /// Fee rate for the CPFP children. Omit for the chain's fast rate.
+    #[tsify(optional)]
+    pub feeRateSatPerVb: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct RemainingExitTransactionsArgs {
+    /// VTXOs to list. Omit for every spendable VTXO; an empty list lists
+    /// nothing.
+    #[tsify(optional)]
+    pub vtxoIds: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -628,7 +657,7 @@ impl Wallet {
         args: Ts<Bolt11InvoiceArgs>,
     ) -> Result<Ts<LightningInvoice>, JsError> {
         let args = args.to_rust()?;
-        Ok(self.core.bolt11_invoice(args.amountSats, args.description, args.token).await?.into_ts()?)
+        Ok(self.core.bolt11_invoice(args.amountSats, args.description, args.token, args.expirySecs).await?.into_ts()?)
     }
 
     /// Create an invoice whose claimed VTXO is delivered to `claimDestination`
@@ -652,7 +681,7 @@ impl Wallet {
     ) -> Result<Ts<LightningInvoice>, JsError> {
         let args = args.to_rust()?;
         Ok(self.core.bolt11_invoice_for_address(
-            args.amountSats, args.claimDestination, args.description, args.token,
+            args.amountSats, args.claimDestination, args.description, args.token, args.expirySecs,
         ).await?.into_ts()?)
     }
 
@@ -1101,6 +1130,51 @@ impl Wallet {
     #[wasm_bindgen(js_name = signExitClaimInputs)]
     pub async fn sign_exit_claim_inputs(&self, psbtBase64: String) -> Result<String, JsError> {
         Ok(self.core.sign_exit_claim_inputs(psbtBase64).await?)
+    }
+
+    /// Sign, without broadcasting, the CPFP child of every exit transaction
+    /// that still needs broadcasting to emergency-exit the given VTXOs, for as
+    /// long as confirmed onchain funds last. Mirrors bark-rest
+    /// `POST /exits/presign`.
+    ///
+    /// Omit `vtxoIds` to presign every spendable VTXO; an empty list presigns
+    /// nothing. `feeRateSatPerVb` defaults to the chain's fast rate. Syncs the
+    /// onchain wallet and exits first.
+    ///
+    /// Execute the result wave by wave: broadcast a wave's packages together
+    /// and wait for them, and its `inMempool` transactions, to confirm before
+    /// the next. No funds are reserved, so a later onchain spend can
+    /// invalidate the children. The children are signed: store the result
+    /// securely.
+    #[wasm_bindgen(js_name = presignEmergencyExit)]
+    pub async fn presign_emergency_exit(
+        &self,
+        args: Ts<PresignEmergencyExitArgs>,
+    ) -> Result<Ts<PresignedExits>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self
+            .core
+            .presign_emergency_exit(args.vtxoIds, args.feeRateSatPerVb)
+            .await?.into_ts()?)
+    }
+
+    /// List every exit transaction of the given VTXOs still awaiting
+    /// confirmation, so anyone can broadcast the exits on the user's behalf.
+    /// Mirrors bark-rest `GET /exits/remaining`.
+    ///
+    /// Omit `vtxoIds` to cover every spendable VTXO; an empty list covers
+    /// nothing. Read-only: signs nothing and never touches the onchain wallet.
+    /// Statuses of started exits reflect the last `syncExits`.
+    #[wasm_bindgen(js_name = remainingExitTransactions)]
+    pub async fn remaining_exit_transactions(
+        &self,
+        args: Ts<RemainingExitTransactionsArgs>,
+    ) -> Result<Ts<RemainingExitTransactions>, JsError> {
+        let args = args.to_rust()?;
+        Ok(self
+            .core
+            .remaining_exit_transactions(args.vtxoIds)
+            .await?.into_ts()?)
     }
 
     // -- Rounds ---------------------------------------------------------------

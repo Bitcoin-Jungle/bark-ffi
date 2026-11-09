@@ -791,14 +791,28 @@ impl Wallet {
     // Lightning (receive)
     // ------------------------------------------------------------------------
 
+    /// Create an invoice for an incoming lightning payment.
+    ///
+    /// `expiry_secs` is how long the invoice can be paid for. It defaults to,
+    /// and cannot exceed, the Ark server's invoice expiry; creating the invoice
+    /// fails if the server does not honour it. Must be at least 1.
     pub async fn bolt11_invoice(
         &self,
         amount_sats: u64,
         description: Option<String>,
         token: Option<String>,
+        expiry_secs: Option<u64>,
     ) -> Result<types::LightningInvoice, Error> {
         let amount = bitcoin::Amount::from_sat(amount_sats);
-        let invoice = self.inner.bolt11_invoice(amount, description, token).await?;
+        let invoice = self
+            .inner
+            .bolt11_invoice_builder()
+            .amount(amount)
+            .description(description)
+            .expiry(invoice_expiry(expiry_secs)?)
+            .token(token)
+            .build()
+            .await?;
         Ok(types::LightningInvoice {
             invoice: invoice.to_string(),
             payment_hash: invoice.payment_hash().to_string(),
@@ -821,12 +835,15 @@ impl Wallet {
     ///
     /// A `claim_destination` owned by this wallet is claimed locally instead of
     /// going through its mailbox.
+    ///
+    /// `expiry_secs` works as in [`Self::bolt11_invoice`].
     pub async fn bolt11_invoice_for_address(
         &self,
         amount_sats: u64,
         claim_destination: String,
         description: Option<String>,
         token: Option<String>,
+        expiry_secs: Option<u64>,
     ) -> Result<types::LightningInvoice, Error> {
         let addr: ark::Address = claim_destination
             .parse()
@@ -834,7 +851,13 @@ impl Wallet {
         let amount = bitcoin::Amount::from_sat(amount_sats);
         let invoice = self
             .inner
-            .bolt11_invoice_for_address(amount, addr, description, token)
+            .bolt11_invoice_builder()
+            .amount(amount)
+            .claim_destination(addr)
+            .description(description)
+            .expiry(invoice_expiry(expiry_secs)?)
+            .token(token)
+            .build()
             .await?;
         Ok(types::LightningInvoice {
             invoice: invoice.to_string(),
@@ -1814,6 +1837,96 @@ impl Wallet {
         Ok(BASE64_STANDARD.encode(&signed_psbt_bytes))
     }
 
+    /// The VTXOs an exit query is about: the given ids, or every spendable
+    /// VTXO when `None`. `Some(vec![])` stays empty on purpose, so a caller
+    /// that filtered its selection down to nothing never gets the whole
+    /// wallet.
+    async fn exit_query_vtxo_ids(&self, vtxo_ids: Option<Vec<String>>) -> Result<Vec<VtxoId>, Error> {
+        match vtxo_ids {
+            Some(ids) => parse_vtxo_ids(&ids),
+            None => self.spendable_vtxo_ids().await,
+        }
+    }
+
+    async fn spendable_vtxo_ids(&self) -> Result<Vec<VtxoId>, Error> {
+        Ok(self
+            .inner
+            .spendable_vtxos()
+            .await
+            .context("Failed to list spendable VTXOs")?
+            .into_iter()
+            .map(|v| v.vtxo.id())
+            .collect())
+    }
+
+    /// Sign, without broadcasting, the CPFP child of every exit transaction
+    /// that still needs broadcasting to emergency-exit the given VTXOs, for as
+    /// long as confirmed onchain funds last.
+    ///
+    /// Mirrors bark-rest `POST /exits/presign`. `vtxo_ids` defaults to every
+    /// spendable VTXO; duplicates resolve to their first occurrence.
+    /// `fee_rate_sat_per_vb` defaults to the chain's *fast* rate. Syncs the
+    /// onchain wallet and exits first, so the plan reflects current funds and
+    /// chain state. See [`types::PresignedExits`] for how to execute it.
+    ///
+    /// Nothing is broadcast and no funds are reserved, so a later onchain
+    /// spend can invalidate the children. The onchain wallet does reveal the
+    /// change addresses the children pay to. Needs the built-in onchain
+    /// wallet: a custom (callback) onchain wallet cannot presign and fails.
+    pub async fn presign_emergency_exit(
+        &self,
+        vtxo_ids: Option<Vec<String>>,
+        fee_rate_sat_per_vb: Option<u64>,
+    ) -> Result<types::PresignedExits, Error> {
+        let ids = self.exit_query_vtxo_ids(vtxo_ids).await?;
+        let fee_rate = checked_fee_rate(fee_rate_sat_per_vb)?;
+
+        info!("[EXIT] Presigning emergency exit for {} VTXOs...", ids.len());
+
+        // Sign against current funds and exit transaction statuses, like
+        // bark-rest.
+        self.inner
+            .sync_onchain()
+            .await
+            .context("Failed to sync onchain wallet")?;
+        self.inner
+            .sync_exits()
+            .await
+            .context("Failed to sync exits")?;
+
+        let presigned = self
+            .inner
+            .presign_emergency_exit(&ids, fee_rate)
+            .await
+            .context("Failed to presign emergency exit")?;
+
+        info!("[EXIT] Presigned {} waves", presigned.waves.len());
+        Ok(presigned.into())
+    }
+
+    /// List every exit transaction of the given VTXOs still awaiting
+    /// confirmation, so anyone can broadcast the exits on the user's behalf.
+    ///
+    /// Mirrors bark-rest `GET /exits/remaining`. `vtxo_ids` defaults to every
+    /// spendable VTXO. Read-only: nothing is signed and the onchain wallet is
+    /// never touched. Works whether or not an exit was started. Statuses of
+    /// started exits reflect the last [`Self::sync_exits`]; call it first for
+    /// the current chain state.
+    pub async fn remaining_exit_transactions(
+        &self,
+        vtxo_ids: Option<Vec<String>>,
+    ) -> Result<types::RemainingExitTransactions, Error> {
+        let ids = self.exit_query_vtxo_ids(vtxo_ids).await?;
+
+        let remaining = self
+            .inner
+            .remaining_exit_transactions(&ids)
+            .await
+            .context("Failed to list remaining exit transactions")?;
+
+        Ok(types::RemainingExitTransactions::from_bark(remaining, &ids))
+    }
+
     // ------------------------------------------------------------------------
     // Round Management
     // ------------------------------------------------------------------------
@@ -2149,21 +2262,12 @@ impl Wallet {
         fee_margin: Option<f64>,
     ) -> Result<types::EmergencyExitFeeEstimate, Error> {
         let ids = if vtxo_ids.is_empty() {
-            self.inner
-                .spendable_vtxos()
-                .await
-                .context("Failed to list spendable VTXOs")?
-                .into_iter()
-                .map(|v| v.vtxo.id())
-                .collect()
+            self.spendable_vtxo_ids().await?
         } else {
             parse_vtxo_ids(&vtxo_ids)?
         };
 
-        let fee_rate = match fee_rate_sat_per_vb {
-            Some(v) => Some(bitcoin::FeeRate::from_sat_per_vb(v).context("Fee rate too large")?),
-            None => None,
-        };
+        let fee_rate = checked_fee_rate(fee_rate_sat_per_vb)?;
 
         let destination = match destination {
             Some(s) => Some(parse_address(&s, self.inner.network().await?)?),
@@ -2192,6 +2296,24 @@ fn lightning_send_options(wait: bool, retry_for_secs: Option<u64>) -> bark::Ligh
     bark::LightningSendOptions::default()
         .wait(wait)
         .retry_for(retry_for_secs.map(std::time::Duration::from_secs))
+}
+
+/// An FFI sat/vB fee rate as bark's, refusing one too large to represent
+/// rather than silently falling back to the default.
+fn checked_fee_rate(fee_rate_sat_per_vb: Option<u64>) -> Result<Option<bitcoin::FeeRate>, Error> {
+    fee_rate_sat_per_vb
+        .map(|v| bitcoin::FeeRate::from_sat_per_vb(v).context("Fee rate too large"))
+        .transpose()
+        .map_err(Error::from)
+}
+
+/// bark's invoice expiry for an FFI `expiry_secs`. `None` keeps the server's
+/// default. Zero is refused: an invoice nobody can pay is never what was meant.
+fn invoice_expiry(expiry_secs: Option<u64>) -> Result<Option<std::time::Duration>, Error> {
+    match expiry_secs {
+        Some(0) => Err(Error::from("invoice expiry must be at least 1 second")),
+        secs => Ok(secs.map(std::time::Duration::from_secs)),
+    }
 }
 
 /// Absolute expiry `expiry_secs` from now.
@@ -2306,6 +2428,15 @@ mod tests {
         let vtxo = parse_vtxo(BOARD_VTXO_HEX).unwrap();
         let id_str = vtxo.id().to_string();
         assert_eq!(id_str.parse::<VtxoId>().unwrap(), vtxo.id());
+    }
+
+    #[test]
+    fn invoice_expiry_maps_seconds_and_refuses_zero() {
+        assert_eq!(invoice_expiry(None).unwrap(), None);
+        assert_eq!(invoice_expiry(Some(1)).unwrap(), Some(std::time::Duration::from_secs(1)));
+        assert_eq!(invoice_expiry(Some(600)).unwrap(), Some(std::time::Duration::from_secs(600)));
+        let err = invoice_expiry(Some(0)).unwrap_err();
+        assert!(err.message().contains("at least 1 second"), "{}", err.message());
     }
 
     #[test]
@@ -2754,6 +2885,55 @@ mod tests {
             req.default_option.map(|o| o.method),
             Some(M::Bitcoin { value: REGTEST_ADDRESS.to_owned() }),
         );
+    }
+
+    /// `None` means every spendable VTXO, but an explicit empty list stays
+    /// empty, so a selection filtered down to nothing never covers the whole
+    /// wallet. Ids are parsed all-or-nothing and bark's errors come through.
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn remaining_exit_transactions_selects_and_rejects_vtxos() {
+        let w = OfflineWallet::open("remaining-exits").await;
+
+        for selection in [Some(vec![]), None] {
+            let r = w.wallet.remaining_exit_transactions(selection.clone()).await
+                .unwrap_or_else(|e| panic!("{:?}: {}", selection, e.message()));
+            assert!(r.exits.is_empty() && r.transactions.is_empty(), "{:?}", selection);
+        }
+
+        let unknown = parse_vtxo(BOARD_VTXO_HEX).unwrap().id().to_string();
+        let err = w.wallet.remaining_exit_transactions(Some(vec![unknown])).await.unwrap_err();
+        assert!(err.message().contains("Unknown VTXO"), "{}", err.message());
+
+        let err = w.wallet
+            .remaining_exit_transactions(Some(vec!["not-a-vtxo".into()])).await
+            .unwrap_err();
+        assert!(err.message().contains("invalid vtxo id"), "{}", err.message());
+    }
+
+    /// Bad input is refused before syncing anything, and valid input syncs
+    /// exits before presigning so the plan reflects the chain. The offline
+    /// stub cannot report a tip, so that sync is where it stops.
+    #[cfg(feature = "uniffi")]
+    #[tokio::test]
+    async fn presign_emergency_exit_validates_then_syncs() {
+        let w = OfflineWallet::open("presign-exits").await;
+
+        let err = w.wallet
+            .presign_emergency_exit(Some(vec!["not-a-vtxo".into()]), None).await
+            .unwrap_err();
+        assert!(err.message().contains("invalid vtxo id"), "{}", err.message());
+
+        let err = w.wallet
+            .presign_emergency_exit(Some(vec![]), Some(u64::MAX)).await
+            .unwrap_err();
+        assert!(err.message().contains("Fee rate too large"), "{}", err.message());
+
+        let unknown = parse_vtxo(BOARD_VTXO_HEX).unwrap().id().to_string();
+        let err = w.wallet
+            .presign_emergency_exit(Some(vec![unknown]), Some(2)).await
+            .unwrap_err();
+        assert!(err.message().starts_with("Failed to sync exits"), "{}", err.message());
     }
 
     #[cfg(feature = "uniffi")]

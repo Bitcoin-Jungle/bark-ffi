@@ -426,15 +426,24 @@ impl Wallet {
     // Lightning (receive)
     // ------------------------------------------------------------------------
 
-    #[uniffi::method(default(token = None))]
+    /// Create an invoice for an incoming lightning payment.
+    ///
+    /// `expiry_secs` is how long the invoice can be paid for. It defaults to,
+    /// and cannot exceed, the Ark server's invoice expiry; creating the invoice
+    /// fails if the server does not honour it. Must be at least 1.
+    #[uniffi::method(default(token = None, expiry_secs = None))]
     pub async fn bolt11_invoice(
         &self,
         amount_sats: u64,
         description: Option<String>,
         token: Option<String>,
+        expiry_secs: Option<u64>,
     ) -> Result<types::LightningInvoice, Error> {
         let core = self.core.clone();
-        run_async(async move { core.bolt11_invoice(amount_sats, description, token).await }).await
+        run_async(async move {
+            core.bolt11_invoice(amount_sats, description, token, expiry_secs).await
+        })
+        .await
     }
 
     /// Create an invoice whose claimed VTXO is delivered to `claim_destination`
@@ -451,18 +460,21 @@ impl Wallet {
     ///
     /// A `claim_destination` owned by this wallet is claimed locally instead of
     /// going through its mailbox.
-    #[uniffi::method(default(description = None, token = None))]
+    ///
+    /// `expiry_secs` works as in [`Self::bolt11_invoice`].
+    #[uniffi::method(default(description = None, token = None, expiry_secs = None))]
     pub async fn bolt11_invoice_for_address(
         &self,
         amount_sats: u64,
         claim_destination: String,
         description: Option<String>,
         token: Option<String>,
+        expiry_secs: Option<u64>,
     ) -> Result<types::LightningInvoice, Error> {
         let core = self.core.clone();
         run_async(async move {
             core.bolt11_invoice_for_address(
-                amount_sats, claim_destination, description, token,
+                amount_sats, claim_destination, description, token, expiry_secs,
             )
             .await
         })
@@ -988,6 +1000,53 @@ impl Wallet {
     pub async fn sign_exit_claim_inputs(&self, psbt_base64: String) -> Result<String, Error> {
         let core = self.core.clone();
         run_async(async move { core.sign_exit_claim_inputs(psbt_base64).await }).await
+    }
+
+    /// Sign, without broadcasting, the CPFP child of every exit transaction
+    /// that still needs broadcasting to emergency-exit the given VTXOs, for as
+    /// long as confirmed onchain funds last. Mirrors bark-rest
+    /// `POST /exits/presign`.
+    ///
+    /// Omit `vtxo_ids` to presign every spendable VTXO; an empty list presigns
+    /// nothing. `fee_rate_sat_per_vb` defaults to the chain's fast rate. Syncs
+    /// the onchain wallet and exits first.
+    ///
+    /// Execute the result wave by wave: broadcast a wave's packages together
+    /// and wait for them, and its `in_mempool` transactions, to confirm before
+    /// the next. No funds are reserved, so a later onchain spend can
+    /// invalidate the children. The children are signed: store the result
+    /// securely.
+    ///
+    /// Needs the built-in onchain wallet; with callback wallets
+    /// (`CustomOnchainWalletCallbacks`) it fails.
+    #[uniffi::method(default(vtxo_ids = None, fee_rate_sat_per_vb = None))]
+    pub async fn presign_emergency_exit(
+        &self,
+        vtxo_ids: Option<Vec<String>>,
+        fee_rate_sat_per_vb: Option<u64>,
+    ) -> Result<types::PresignedExits, Error> {
+        let core = self.core.clone();
+        run_async(async move {
+            core.presign_emergency_exit(vtxo_ids, fee_rate_sat_per_vb).await
+        })
+        .await
+    }
+
+    /// List every exit transaction of the given VTXOs still awaiting
+    /// confirmation, so anyone can broadcast the exits on the user's behalf.
+    /// Mirrors bark-rest `GET /exits/remaining`.
+    ///
+    /// Omit `vtxo_ids` to cover every spendable VTXO; an empty list covers
+    /// nothing. Read-only: signs nothing and never touches the onchain wallet,
+    /// so it works with callback wallets too. Statuses of started exits reflect
+    /// the last `sync_exits`.
+    #[uniffi::method(default(vtxo_ids = None))]
+    pub async fn remaining_exit_transactions(
+        &self,
+        vtxo_ids: Option<Vec<String>>,
+    ) -> Result<types::RemainingExitTransactions, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.remaining_exit_transactions(vtxo_ids).await }).await
     }
 
     // ------------------------------------------------------------------------
