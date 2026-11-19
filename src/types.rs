@@ -2803,6 +2803,113 @@ impl From<bark::WalletNotification> for WalletNotification {
     }
 }
 
+// ============================================================================
+// Nostr Wallet Connect
+// ============================================================================
+
+/// A NIP-47 method an NWC connection can be granted.
+// Serde/TS names are the NIP-47 method names, e.g. `"pay_invoice"`.
+#[cfg(feature = "nwc")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "wasm-web", derive(tsify::Tsify))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum NwcMethod {
+    /// Read the wallet's network, block height and supported methods.
+    GetInfo,
+    /// Read the wallet's spendable balance.
+    GetBalance,
+    /// Create Lightning invoices that pay into the wallet.
+    MakeInvoice,
+    /// Look up an invoice or payment of the wallet.
+    LookupInvoice,
+    /// Pay Lightning invoices from the wallet. There is no spending limit:
+    /// an app granted this can spend the whole balance.
+    PayInvoice,
+    /// Read the wallet's Lightning payment history.
+    ListTransactions,
+}
+
+#[cfg(feature = "nwc")]
+impl NwcMethod {
+    pub const ALL: [NwcMethod; 6] = [
+        NwcMethod::GetInfo,
+        NwcMethod::GetBalance,
+        NwcMethod::MakeInvoice,
+        NwcMethod::LookupInvoice,
+        NwcMethod::PayInvoice,
+        NwcMethod::ListTransactions,
+    ];
+
+    /// The NIP-47 method name, e.g. `"pay_invoice"`, as the connection
+    /// store records it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NwcMethod::GetInfo => "get_info",
+            NwcMethod::GetBalance => "get_balance",
+            NwcMethod::MakeInvoice => "make_invoice",
+            NwcMethod::LookupInvoice => "lookup_invoice",
+            NwcMethod::PayInvoice => "pay_invoice",
+            NwcMethod::ListTransactions => "list_transactions",
+        }
+    }
+
+    /// The method a NIP-47 method name names, if it is one bark serves.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == name)
+    }
+}
+
+/// An app's NWC access to the wallet.
+#[cfg(feature = "nwc")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct NwcConnection {
+    /// The name the connection was created with.
+    pub name: String,
+    /// The app's public key, hex-encoded. Identifies the connection, e.g. to
+    /// revoke it.
+    pub client_pubkey: String,
+    /// The methods the app may call.
+    pub methods: Vec<NwcMethod>,
+    /// RFC 3339.
+    pub created_at: String,
+}
+
+/// A newly created NWC connection.
+#[cfg(feature = "nwc")]
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct NwcConnectionUri {
+    /// The `nostr+walletconnect://` URI to hand to the app. It carries the
+    /// app's secret key, which the wallet does not keep: whoever holds the
+    /// URI can use the connection. Show it once, never log or store it.
+    pub uri: String,
+    /// The app's public key, hex-encoded, as [`NwcConnection`] lists it.
+    pub client_pubkey: String,
+}
+
+/// Leaves the URI out: it carries the app's secret key.
+#[cfg(feature = "nwc")]
+impl std::fmt::Debug for NwcConnectionUri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NwcConnectionUri")
+            .field("uri", &"<redacted>")
+            .field("client_pubkey", &self.client_pubkey)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

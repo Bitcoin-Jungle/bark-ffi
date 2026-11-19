@@ -66,6 +66,20 @@ clippy-wasm:
     - rustup target add wasm32-unknown-unknown
     - cargo clippy --locked --no-default-features --features wasm-web --target wasm32-unknown-unknown -- -D warnings
 
+# `nwc` gates its own source in every layer, so it is checked on both flavors.
+clippy-uniffi-nwc:
+  stage: check
+  needs: []
+  script:
+    - cargo clippy --locked --no-default-features --features uniffi,nwc --all-targets -- -D warnings
+
+clippy-wasm-nwc:
+  stage: check
+  needs: []
+  script:
+    - rustup target add wasm32-unknown-unknown
+    - cargo clippy --locked --no-default-features --features wasm-web,nwc --target wasm32-unknown-unknown -- -D warnings
+
 # Clippy does not codegen; this links the cdylib/staticlib the bindings use.
 build-uniffi:
   stage: test
@@ -73,11 +87,23 @@ build-uniffi:
   script:
     - cargo build --locked --no-default-features --features uniffi
 
+build-uniffi-nwc:
+  stage: test
+  needs: []
+  script:
+    - cargo build --locked --no-default-features --features uniffi,nwc
+
 test-uniffi:
   stage: test
   needs: []
   script:
     - cargo test --locked --no-default-features --features uniffi
+
+test-uniffi-nwc:
+  stage: test
+  needs: []
+  script:
+    - cargo test --locked --no-default-features --features uniffi,nwc
 
 # Blocks deliberately: accept an advisory in .cargo/audit.toml rather than
 # letting the job fail. Advisories only for now; add --deny unmaintained

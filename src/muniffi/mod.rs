@@ -1,6 +1,8 @@
 pub mod custom_onchain_wallet;
 pub mod db;
 pub mod logger;
+#[cfg(feature = "nwc")]
+pub mod nwc;
 pub mod onchain;
 pub mod runtime;
 pub mod wallet;

@@ -75,3 +75,31 @@ export CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang  # macOS
 export AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
 cargo check --no-default-features --features wasm-web --target wasm32-unknown-unknown
 ```
+
+### Nostr Wallet Connect
+
+The `nwc` feature adds [NIP-47](https://github.com/nostr-protocol/nips/blob/master/47.md)
+on top of either flavor, so an app can drive the wallet through a nostr relay:
+
+```sh
+cargo build --no-default-features --features uniffi,nwc
+```
+
+It is off by default: it pulls in the nostr stack and, natively, a TLS stack
+for the relays. With it, `Wallet` gains `nwcAddRelay`, `nwcRemoveRelay`,
+`nwcRelays`, `nwcCreateConnection`, `nwcConnections` and `nwcRevokeConnection`.
+Add a relay, then create a connection and hand its URI to the app.
+
+- Requests are answered while the daemon runs, so on mobile only while the
+  app is. A connection created with the daemon stopped is served once it
+  starts.
+- The URI carries the app's secret key and cannot be shown again. Anyone
+  holding it can use the connection until it is revoked.
+- There are no spending limits: `pay_invoice` lets the app spend the whole
+  balance.
+- A URI names the relays it was created with. Removing them cuts its app off.
+- Connections, with their service keys, are kept in `nwc.json` in the datadir
+  (owner-only on unix), or in the IndexedDB database `<wallet database>.nwc`
+  on wasm. Delete it along with the wallet's.
+- Keep one open copy of a wallet, such as one browser tab: two copies each
+  serve the connections they loaded and overwrite each other's changes.

@@ -1,4 +1,6 @@
 pub mod notification;
+#[cfg(feature = "nwc")]
+pub mod nwc;
 pub mod onchain;
 pub mod wallet;
 

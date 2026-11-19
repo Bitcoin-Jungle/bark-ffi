@@ -29,6 +29,9 @@ pub struct Wallet {
     /// Outcome of the seed recovery scan `bark::Wallet::open` ran.
     /// See [`Wallet::recovery_status`].
     recovery_status: types::RecoveryStatus,
+    /// NWC as open registered it, or why it is unavailable.
+    #[cfg(feature = "nwc")]
+    nwc: Result<Arc<crate::core::nwc::Nwc>, Arc<str>>,
 }
 
 /// Optional arguments for [`Wallet::open`].
@@ -45,6 +48,9 @@ pub struct OpenArgs {
     /// Skip the seed recovery that otherwise starts when this open creates
     /// the wallet locally.
     pub skip_recovery: bool,
+    /// Where NWC connections are kept. Without one, NWC is unavailable.
+    #[cfg(feature = "nwc")]
+    pub nwc_store: Option<Arc<dyn crate::core::nwc::NwcStore>>,
 }
 
 impl OpenArgs {
@@ -153,13 +159,31 @@ fn recovery_summary(report: &types::RecoveryReport) -> String {
     )
 }
 
+/// Start `inner`'s daemon, through NWC when it is set up so it knows its
+/// connections are served.
+#[cfg(feature = "nwc")]
+fn start_daemon(
+    inner: &bark::Wallet,
+    nwc: &Result<Arc<crate::core::nwc::Nwc>, Arc<str>>,
+) -> anyhow::Result<()> {
+    match nwc {
+        Ok(nwc) => nwc.start_daemon(inner),
+        Err(_) => inner.start_daemon(),
+    }
+}
+
 #[allow(dead_code)] // some methods are wired only via the uniffi layer
 impl Wallet {
     /// Build from an already-constructed `bark::Wallet`. `pub(crate)` so binding
     /// wrappers that construct the inner wallet themselves (e.g. the uniffi
     /// callback-onchain path) can reuse it.
     pub(crate) fn from_inner(inner: bark::Wallet) -> Self {
-        Self { inner, recovery_status: types::RecoveryStatus::NotRun }
+        Self {
+            inner,
+            recovery_status: types::RecoveryStatus::NotRun,
+            #[cfg(feature = "nwc")]
+            nwc: Err(Arc::from("NWC is not set up for this wallet")),
+        }
     }
 
     pub(crate) fn inner(&self) -> &bark::Wallet {
@@ -210,7 +234,16 @@ impl Wallet {
         let network = network.into();
         let cfg = config.into_bark(network)?;
         let seed = seed_from_str(network, &mnemonic_or_seed)?;
+        #[cfg(feature = "nwc")]
+        let mut args = args;
+        #[cfg(feature = "nwc")]
+        let nwc_store = args.nwc_store.take();
         let mut args = args.into_bark();
+        // NWC has to be registered before the daemon starts, since starting
+        // it is what starts serving, and `bark::Wallet::open` would start it
+        // before NWC exists. So start it here instead, once NWC is in.
+        #[cfg(feature = "nwc")]
+        let run_daemon = std::mem::replace(&mut args.run_daemon, false);
 
         // The seed recovery runs inside `bark::Wallet::open` and reports
         // through this callback, so stash its outcome and hand it to callers via
@@ -240,6 +273,21 @@ impl Wallet {
 
         let inner = bark::Wallet::open(network, seed, cfg, args).await?;
 
+        // A store that cannot be read leaves NWC unavailable rather than the
+        // wallet unopenable, and is not written to.
+        #[cfg(feature = "nwc")]
+        let nwc = match nwc_store {
+            Some(store) => crate::core::nwc::register(&inner, store).await.map_err(|e| {
+                warn!("[OPEN] NWC is unavailable: {:#}", e);
+                Arc::<str>::from(format!("NWC is unavailable: {:#}", e))
+            }),
+            None => Err(Arc::from("NWC is not set up for this wallet")),
+        };
+        #[cfg(feature = "nwc")]
+        if run_daemon {
+            start_daemon(&inner, &nwc).context("failed to start daemon after opening wallet")?;
+        }
+
         if inner.ark_info().await.ok().flatten().is_some() {
             info!("[OPEN] Server connection established");
         } else {
@@ -256,7 +304,12 @@ impl Wallet {
             .unwrap()
             .take()
             .unwrap_or(types::RecoveryStatus::NotRun);
-        Ok(Self { inner, recovery_status })
+        Ok(Self {
+            inner,
+            recovery_status,
+            #[cfg(feature = "nwc")]
+            nwc,
+        })
     }
 
     /// Outcome of the seed recovery as [`Self::open`] saw it. A snapshot: it
@@ -282,14 +335,49 @@ impl Wallet {
         self.recovery_status.report().cloned()
     }
 
+    /// The wallet's NWC, or why it is unavailable.
+    #[cfg(feature = "nwc")]
+    pub(crate) fn nwc(&self) -> Result<&Arc<crate::core::nwc::Nwc>, Error> {
+        self.nwc.as_ref().map_err(|reason| Error::from(reason.to_string()))
+    }
+
     // ------------------------------------------------------------------------
     // Daemon
     // ------------------------------------------------------------------------
 
-    /// Stop the background daemon, if running, and wait until its tasks have
-    /// finished, so the caller knows nothing runs in the background anymore
-    /// (e.g. before wiping the wallet's datadir). No-op without a daemon.
+    /// Start the background daemon. No-op when it is running already.
+    pub fn start_daemon(&self) -> Result<(), Error> {
+        #[cfg(feature = "nwc")]
+        start_daemon(&self.inner, &self.nwc)?;
+        #[cfg(not(feature = "nwc"))]
+        self.inner.start_daemon()?;
+        Ok(())
+    }
+
+    /// Stop the background daemon without waiting for its tasks. No-op
+    /// without a daemon.
+    pub fn stop_daemon(&self) {
+        #[cfg(feature = "nwc")]
+        if let Ok(nwc) = &self.nwc {
+            nwc.stop_daemon(&self.inner);
+            return;
+        }
+        self.inner.stop_daemon();
+    }
+
+    /// Stop the background daemon, if running, and wait until it has
+    /// finished, e.g. before wiping the wallet's datadir. No-op without a
+    /// daemon.
+    ///
+    /// While another call already waits for the daemon, this returns at once
+    /// without waiting. On wasm the daemon is cancelled but not waited for. A
+    /// start made while it waits goes ahead, so the daemon runs again after.
     pub async fn stop_daemon_wait(&self) -> Result<(), Error> {
+        #[cfg(feature = "nwc")]
+        if let Ok(nwc) = &self.nwc {
+            nwc.stop_daemon_wait(&self.inner).await.context("Stop daemon failed")?;
+            return Ok(());
+        }
         self.inner.stop_daemon_wait().await.context("Stop daemon failed")?;
         Ok(())
     }
@@ -2762,6 +2850,8 @@ mod tests {
                     create_if_not_exists: true,
                     create_without_server: true,
                     skip_recovery: true,
+                    #[cfg(feature = "nwc")]
+                    nwc_store: None,
                 },
             )
             .await
@@ -2828,6 +2918,191 @@ mod tests {
         let by_uri = open(&uri, false).await
             .unwrap_or_else(|e| panic!("reopen by URI failed: {}", e.message()));
         assert_eq!(by_uri.fingerprint(), fingerprint);
+    }
+
+    /// NWC through the FFI wallet: relays and connections change, are kept
+    /// in the datadir and come back on reopen, also with the daemon running.
+    #[cfg(all(feature = "uniffi", feature = "nwc"))]
+    #[tokio::test]
+    async fn nwc_connections_and_relays_survive_a_reopen() {
+        use crate::muniffi::nwc::NWC_FILE;
+        use crate::muniffi::wallet::{Wallet as FfiWallet, WalletOpenArgs};
+        use crate::types::NwcMethod;
+
+        let datadir = TempDatadir(
+            std::env::temp_dir().join(format!("bark-ffi-test-nwc-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&datadir.0);
+        let path = datadir.0.to_str().unwrap().to_owned();
+        let file = datadir.0.join(NWC_FILE);
+
+        let mut config = minimal_config();
+        config.server_address = "http://127.0.0.1:1".to_owned();
+        config.esplora_address = Some(stub_esplora());
+        // A seed of its own: bark serializes creates per seed process-wide.
+        let open = |run_daemon: bool| FfiWallet::open(
+            Network::Regtest,
+            "letter advice cage absurd amount doctor acoustic avoid \
+             letter advice cage above".to_owned(),
+            config.clone(),
+            WalletOpenArgs {
+                run_daemon,
+                datadir: path.clone(),
+                onchain: None,
+                create_if_not_exists: true,
+                create_without_server: true,
+                skip_recovery: true,
+            },
+        );
+
+        let w = open(false).await
+            .unwrap_or_else(|e| panic!("wallet did not open: {}", e.message()));
+        assert!(w.nwc_relays().unwrap().is_empty());
+        assert!(w.nwc_connections().unwrap().is_empty());
+
+        // An app could never reach a connection made without a relay.
+        let err = w.nwc_create_connection("app".to_owned(), vec![NwcMethod::GetBalance])
+            .await.expect_err("created a connection without a relay");
+        assert!(err.message().contains("no NWC relays"), "{}", err.message());
+        assert!(!file.exists(), "a refused change was written");
+
+        let err = w.nwc_add_relay("https://relay.example.com".to_owned()).await
+            .expect_err("took a relay that is not a websocket");
+        assert!(err.message().contains("ws://"), "{}", err.message());
+
+        // Nothing listens on port 1, so the services NWC starts fail fast.
+        let relays = w.nwc_add_relay("ws://127.0.0.1:1".to_owned()).await.unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(w.nwc_add_relay(relays[0].clone()).await.unwrap(), relays, "added twice");
+        assert_eq!(w.nwc_relays().unwrap(), relays);
+
+        assert!(w.nwc_create_connection("app".to_owned(), vec![]).await.is_err());
+        let created = w.nwc_create_connection(
+            "app".to_owned(),
+            vec![NwcMethod::PayInvoice, NwcMethod::GetBalance, NwcMethod::GetBalance],
+        ).await.unwrap();
+        assert!(created.uri.starts_with("nostr+walletconnect://"), "{}", created.uri);
+        assert!(!format!("{:?}", created).contains(&created.uri), "Debug shows the URI");
+
+        let listed = w.nwc_connections().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "app");
+        assert_eq!(listed[0].client_pubkey, created.client_pubkey);
+        assert_eq!(listed[0].methods, vec![NwcMethod::GetBalance, NwcMethod::PayInvoice]);
+
+        // The app's secret lives in its URI only, and the store is owner-only.
+        let secret = created.uri.split("secret=").nth(1).unwrap().split('&').next().unwrap();
+        assert_eq!(secret.len(), 64, "{}", created.uri);
+        assert!(!std::fs::read_to_string(&file).unwrap().contains(secret));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(w);
+
+        let w = open(true).await
+            .unwrap_or_else(|e| panic!("reopen with the daemon failed: {}", e.message()));
+        assert_eq!(w.nwc_relays().unwrap(), relays);
+        let reopened = w.nwc_connections().unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].client_pubkey, listed[0].client_pubkey);
+        assert_eq!(reopened[0].methods, listed[0].methods);
+        assert_eq!(reopened[0].created_at, listed[0].created_at);
+
+        let pubkey = created.client_pubkey.to_uppercase();
+        assert!(w.nwc_revoke_connection(pubkey.clone()).await.unwrap());
+        assert!(!w.nwc_revoke_connection(pubkey).await.unwrap(), "revoked twice");
+        let err = w.nwc_remove_relay("ws://127.0.0.1:2".to_owned()).await
+            .expect_err("removed a relay that was not there");
+        assert!(err.message().contains("no such NWC relay"), "{}", err.message());
+        assert!(w.nwc_remove_relay(relays[0].clone()).await.unwrap().is_empty());
+        w.stop_daemon_wait().await.unwrap();
+        drop(w);
+
+        let w = open(false).await.unwrap();
+        assert!(w.nwc_connections().unwrap().is_empty());
+        assert!(w.nwc_relays().unwrap().is_empty());
+        drop(w);
+
+        // A store that cannot be read leaves NWC unavailable, not the wallet,
+        // and is not overwritten.
+        std::fs::write(&file, b"not json").unwrap();
+        let w = open(false).await
+            .unwrap_or_else(|e| panic!("a bad NWC store kept the wallet shut: {}", e.message()));
+        let err = w.nwc_relays().expect_err("NWC up on a store it could not read");
+        assert!(err.message().contains("NWC is unavailable"), "{}", err.message());
+        assert!(w.nwc_add_relay("ws://127.0.0.1:1".to_owned()).await.is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"not json");
+    }
+
+    /// A start and a relay change made while a stop waits start no NWC
+    /// service before the stop is done, and the start is made after it.
+    #[cfg(all(feature = "uniffi", feature = "nwc"))]
+    #[tokio::test]
+    async fn nwc_serves_nothing_until_a_waiting_stop_is_done() {
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+        use crate::muniffi::wallet::{Wallet as FfiWallet, WalletOpenArgs};
+        use crate::types::NwcMethod;
+
+        let datadir = TempDatadir(
+            std::env::temp_dir().join(format!("bark-ffi-test-nwc-wait-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&datadir.0);
+        let mut config = minimal_config();
+        config.server_address = "http://127.0.0.1:1".to_owned();
+        config.esplora_address = Some(stub_esplora());
+        // A seed of its own: bark serializes creates per seed process-wide.
+        let w = FfiWallet::open(
+            Network::Regtest,
+            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong".to_owned(),
+            config,
+            WalletOpenArgs {
+                run_daemon: false,
+                datadir: datadir.0.to_str().unwrap().to_owned(),
+                onchain: None,
+                create_if_not_exists: true,
+                create_without_server: true,
+                skip_recovery: true,
+            },
+        ).await.unwrap_or_else(|e| panic!("wallet did not open: {}", e.message()));
+        let core = w.core();
+        let nwc = core.nwc().unwrap();
+
+        // Nothing listens on port 1, so the services find no relay there.
+        nwc.add_relay("ws://127.0.0.1:1").await.unwrap();
+        nwc.create_connection("app".to_owned(), vec![NwcMethod::GetBalance]).await.unwrap();
+        // A relay no service is on yet: one that starts on it connects here.
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("ws://{}", relay.local_addr().unwrap());
+
+        // Started from this current-thread runtime, the daemon and services
+        // only run while the test awaits. None has run yet, so the daemon's
+        // task cannot have finished and the stop is held waiting for it.
+        core.start_daemon().unwrap();
+        let mut stop = Box::pin(core.stop_daemon_wait());
+        let pending = std::future::poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx).is_pending()));
+        assert!(pending.await, "the stop did not wait for the daemon");
+
+        core.start_daemon().unwrap();
+        nwc.add_relay(&relay_url).await.unwrap();
+        // The daemon's task gets to finish meanwhile, but the stop is only
+        // done once it is polled again.
+        let early = tokio::time::timeout(Duration::from_millis(500), relay.accept()).await;
+        assert!(early.is_err(), "a service started while the stop waited");
+        assert!(!nwc.serving());
+
+        stop.await.unwrap();
+        assert!(nwc.serving(), "the start asked for was lost");
+        tokio::time::timeout(Duration::from_secs(10), relay.accept()).await
+            .expect("no service started on the new relay after the stop")
+            .unwrap();
+
+        core.stop_daemon_wait().await.unwrap();
+        assert!(!nwc.serving());
     }
 
     /// A URI this wallet builds parses back to what went in. Only the onchain

@@ -40,6 +40,11 @@ wasm-web = [
     "bark-bitcoin-ext/wasm-web",
 ]
 
+# Nostr Wallet Connect (NIP-47): lets an app drive the wallet through a nostr
+# relay. Off by default: it pulls in the nostr stack, with its own secp256k1,
+# and natively a TLS stack for the relays. Combine with `uniffi` or `wasm-web`.
+nwc = ["bark/nwc", "dep:rustls"]
+
 [dependencies.ark]
 package = "ark-lib"
 git = "https://gitlab.com/ark-bitcoin/bark"
@@ -87,3 +92,12 @@ wasm-bindgen = { version = "0.2.100", optional = true }
 wasm-bindgen-futures = { version = "0.4.56", optional = true }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
 tsify = { version = "0.5.6", default-features = false, features = ["js"], optional = true }
+
+# nwc-only, native: picks the TLS provider relays connect with. Not a wasm dep,
+# where the browser terminates TLS.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+# Native tests stand in for an NWC relay and bound how long they wait on one.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1.35", default-features = false, features = ["net", "time"] }
