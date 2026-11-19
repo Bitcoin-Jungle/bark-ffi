@@ -292,11 +292,11 @@ pub struct OpenWalletArgs {
     #[serde(default)]
     pub create_without_server: bool,
 
-    /// Whether to skip the seed-recovery mailbox scan
+    /// Whether to skip the recovery from seed
     ///
-    /// The scan runs on the open that creates the wallet locally and makes
-    /// network calls; its outcome is available from `recoveryStatus()`. Set this
-    /// to open without it.
+    /// The recovery starts on the open that creates the wallet locally, makes
+    /// network calls, and resumes on every sync until it is done; its outcome
+    /// is available from `recoveryStatus()`. Set this to open without it.
     ///
     /// Default: false
     #[tsify(optional)]
@@ -878,8 +878,11 @@ impl Wallet {
     // -- Recovery -------------------------------------------------------------
 
     /// Recover the given VTXO ids from the server, importing the ones this
-    /// wallet owns that are still spendable. Use it to retry ids a previous scan
-    /// reported as `failed`.
+    /// wallet owns that are still spendable. Use it to retry ids a previous
+    /// recovery reported as `failed` or `abandoned`.
+    ///
+    /// Fails while a recovery from seed is being driven, as both work on the
+    /// same locked VTXOs.
     ///
     /// `gapLimit` overrides `vtxoKeyGapLimit` from the wallet config for the key
     /// scan that decides which of `vtxoIds` this wallet owns. Widen it to reach
@@ -893,26 +896,49 @@ impl Wallet {
         Ok(self.core.recover_vtxos(vtxoIds, gapLimit).await?.into_ts()?)
     }
 
-    /// Outcome of the seed-recovery scan that ran during `open`.
+    /// Outcome of the recovery from seed as `open` saw it. A snapshot: it
+    /// does not change after open, see `pendingRecovery` for the live state.
     ///
-    /// Recovery only runs on the open that creates the wallet locally, and not
-    /// at all when `skipRecovery` is set, so this is `not-run` on every
-    /// subsequent open. `failed` means the scan errored before producing a
-    /// report — bark logs that and lets open succeed — so funds may be missing
-    /// until a retry; `completed` carries the report, and `isComplete === false`
-    /// there means funds may still be missing. Retry the report's `failed` ids
-    /// with `recoverVtxos`.
+    /// Recovery starts on the open that creates the wallet locally, unless
+    /// `skipRecovery` is set. A later open reports `in-progress` while that
+    /// recovery is not done, and `not-run` otherwise. `failed` means the
+    /// recovery could not be started or read back — bark logs that and lets
+    /// open succeed — so funds may be missing. `in-progress` means it stopped
+    /// before it was done; every sync resumes it. `completed` carries the
+    /// final report, and `isComplete === false` there means funds may still be
+    /// missing.
     #[wasm_bindgen(js_name = recoveryStatus)]
     pub fn recovery_status(&self) -> Result<Ts<RecoveryStatus>, JsError> {
         Ok(self.core.recovery_status().into_ts()?)
     }
 
-    /// The report of the seed-recovery scan that ran during `open`, or
-    /// `undefined` if the scan did not complete. Use `recoveryStatus` to tell a
-    /// scan that failed apart from one that never ran.
+    /// The report of the recovery from seed as `open` saw it, or `undefined`
+    /// if it did not run or failed. Use `recoveryStatus` to tell these apart.
     #[wasm_bindgen(js_name = recoveryReport)]
     pub fn recovery_report(&self) -> Result<Option<Ts<RecoveryReport>>, JsError> {
         Ok(self.core.recovery_report().map(|v| v.into_ts()).transpose()?)
+    }
+
+    /// The report of the recovery from seed in progress, or `undefined` once
+    /// it is done (or if none ever ran). Its `failed` VTXOs are the ones still
+    /// missing: they are kept locked until the server gives their status.
+    ///
+    /// When a recovery resumed after open is done, bark only logs its final
+    /// report; it cannot be read here. VTXOs it gave up on (`abandoned`) stay
+    /// locked, so they still show in `vtxos`.
+    #[wasm_bindgen(js_name = pendingRecovery)]
+    pub async fn pending_recovery(&self) -> Result<Option<Ts<RecoveryReport>>, JsError> {
+        Ok(self.core.pending_recovery().await?.map(|v| v.into_ts()).transpose()?)
+    }
+
+    /// Drive the recovery from seed in progress, if any, until it is done or
+    /// parks again. Does nothing while another drive holds its lock.
+    ///
+    /// This already runs as part of `sync`; call it to resume the recovery on
+    /// demand.
+    #[wasm_bindgen(js_name = syncPendingRecovery)]
+    pub async fn sync_pending_recovery(&self) -> Result<(), JsError> {
+        Ok(self.core.sync_pending_recovery().await?)
     }
 
     // -- Info -----------------------------------------------------------------
@@ -945,32 +971,79 @@ impl Wallet {
 
     // -- Boarding -------------------------------------------------------------
 
+    /// Board `amountSats` from the onchain wallet.
+    ///
+    /// `expiryHeight` sets the block height at which the board VTXO expires.
+    /// It defaults to `boardLifetime` from the wallet config blocks from the
+    /// tip, capped at the server's VTXO lifetime; an expiry beyond that
+    /// lifetime, or too close to the tip to confirm and register in time, is
+    /// refused.
     #[wasm_bindgen(js_name = boardAmount)]
-    pub async fn board_amount(&self, amountSats: f64) -> Result<Ts<PendingBoard>, JsError> {
-        Ok(self.core.board_amount(amountSats as u64).await?.into_ts()?)
+    pub async fn board_amount(
+        &self,
+        amountSats: f64,
+        expiryHeight: Option<u32>,
+    ) -> Result<Ts<PendingBoard>, JsError> {
+        Ok(self.core.board_amount(amountSats as u64, expiryHeight).await?.into_ts()?)
     }
 
+    /// Board all funds of the onchain wallet. See `boardAmount` for
+    /// `expiryHeight`.
     #[wasm_bindgen(js_name = boardAll)]
-    pub async fn board_all(&self) -> Result<Ts<PendingBoard>, JsError> {
-        Ok(self.core.board_all().await?.into_ts()?)
+    pub async fn board_all(&self, expiryHeight: Option<u32>) -> Result<Ts<PendingBoard>, JsError> {
+        Ok(self.core.board_all(expiryHeight).await?.into_ts()?)
     }
 
+    /// Derive a fresh key and return the address to fund a board with from
+    /// elsewhere, e.g. as a payjoin receiver. Persist the returned info and
+    /// pass it to `boardPsbt` with the funding PSBT. See `boardAmount` for
+    /// `expiryHeight`.
     #[wasm_bindgen(js_name = boardFundingAddress)]
-    pub async fn board_funding_address(&self) -> Result<Ts<BoardFundingInfo>, JsError> {
-        Ok(self.core.board_funding_address().await?.into_ts()?)
+    pub async fn board_funding_address(
+        &self,
+        expiryHeight: Option<u32>,
+    ) -> Result<Ts<BoardFundingInfo>, JsError> {
+        Ok(self.core.board_funding_address(expiryHeight).await?.into_ts()?)
     }
 
+    /// Rebuild the funding info of a funding address made before
+    /// `BoardFundingInfo` carried `userPubkey`, from the `keypairIndex` and
+    /// `expiryHeight` stored alongside it.
+    ///
+    /// Only for boards funded through the old `boardFundingAddress`. If the
+    /// server's key or exit delta changed since, the rebuilt address won't
+    /// match and `boardPsbt` refuses the PSBT.
+    #[wasm_bindgen(js_name = legacyBoardFundingAddress)]
+    pub async fn legacy_board_funding_address(
+        &self,
+        keypairIndex: u32,
+        expiryHeight: u32,
+    ) -> Result<Ts<BoardFundingInfo>, JsError> {
+        Ok(self
+            .core
+            .legacy_board_funding_address(keypairIndex, expiryHeight)
+            .await?.into_ts()?)
+    }
+
+    /// Board from a funding PSBT paying the address of `funding`, made by
+    /// `boardFundingAddress`.
+    ///
+    /// A finalized PSBT is broadcast by bark; an unfinalized one leaves the
+    /// broadcast to another party and bark waits for the transaction to
+    /// appear. The board commits to the PSBT's txid, so if the other party
+    /// changes the transaction, call this again with the new PSBT and the
+    /// same `funding`.
+    ///
+    /// Fails once `funding` is too close to its expiry height; make a new
+    /// funding address then.
     #[wasm_bindgen(js_name = boardPsbt)]
     pub async fn board_psbt(
         &self,
         psbtBase64: String,
-        keypairIndex: u32,
-        expiryHeight: u32,
+        funding: Ts<BoardFundingInfo>,
     ) -> Result<Ts<PendingBoard>, JsError> {
-        Ok(self
-            .core
-            .board_psbt(psbtBase64, keypairIndex, expiryHeight)
-            .await?.into_ts()?)
+        let funding = funding.to_rust()?;
+        Ok(self.core.board_psbt(psbtBase64, funding).await?.into_ts()?)
     }
 
     #[wasm_bindgen(js_name = syncPendingBoards)]

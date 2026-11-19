@@ -45,11 +45,12 @@ pub struct WalletOpenArgs {
     #[uniffi(default = false)]
     pub create_without_server: bool,
 
-    /// Whether to skip the seed-recovery mailbox scan
+    /// Whether to skip the recovery from seed
     ///
-    /// The scan runs on the open that creates the wallet locally and makes
-    /// network calls; its outcome is available from `Wallet::recovery_status`.
-    /// Set this to open without it.
+    /// The recovery starts on the open that creates the wallet locally, makes
+    /// network calls, and resumes on every sync until it is done; its outcome
+    /// is available from `Wallet::recovery_status`. Set this to open without
+    /// it.
     ///
     /// Default: false
     #[uniffi(default = false)]
@@ -708,7 +709,10 @@ impl Wallet {
 
     /// Recover the given VTXO ids from the server, importing the ones this
     /// wallet owns that are still spendable. Use it to retry ids a previous
-    /// scan reported as `failed`.
+    /// recovery reported as `failed` or `abandoned`.
+    ///
+    /// Fails while a recovery from seed is being driven, as both work on the
+    /// same locked VTXOs.
     ///
     /// `gap_limit` overrides `Config.vtxo_key_gap_limit` for the key scan that
     /// decides which of `vtxo_ids` this wallet owns. Widen it to reach ids a
@@ -723,24 +727,48 @@ impl Wallet {
         run_async(async move { core.recover_vtxos(vtxo_ids, gap_limit).await }).await
     }
 
-    /// Outcome of the seed-recovery scan that ran during `Wallet::open`.
+    /// Outcome of the recovery from seed as `Wallet::open` saw it. A
+    /// snapshot: it does not change after open, see `pending_recovery` for the
+    /// live state.
     ///
-    /// Recovery only runs on the open that creates the wallet locally, and not
-    /// at all when `WalletOpenArgs.skip_recovery` is set, so this is `NotRun`
-    /// on every subsequent open. `Failed` means the scan errored before
-    /// producing a report — bark logs that and lets open succeed — so funds
-    /// may be missing until a retry; `Completed` carries the report, and
-    /// `isComplete == false` there means funds may still be missing. Retry the
-    /// report's `failed` ids with `recoverVtxos`.
+    /// Recovery starts on the open that creates the wallet locally, unless
+    /// `WalletOpenArgs.skip_recovery` is set. A later open reports
+    /// `InProgress` while that recovery is not done, and `NotRun` otherwise.
+    /// `Failed` means the recovery could not be started or read back — bark
+    /// logs that and lets open succeed — so funds may be missing. `InProgress`
+    /// means it stopped before it was done; every sync resumes it. `Completed`
+    /// carries the final report, and `isComplete == false` there means funds
+    /// may still be missing.
     pub fn recovery_status(&self) -> types::RecoveryStatus {
         self.core.recovery_status()
     }
 
-    /// The report of the seed-recovery scan that ran during `Wallet::open`, or
-    /// none if the scan did not complete. Use `recovery_status` to tell a scan
-    /// that failed apart from one that never ran.
+    /// The report of the recovery from seed as `Wallet::open` saw it, or none
+    /// if it did not run or failed. Use `recovery_status` to tell these apart.
     pub fn recovery_report(&self) -> Option<types::RecoveryReport> {
         self.core.recovery_report()
+    }
+
+    /// The report of the recovery from seed in progress, or none once it is
+    /// done (or if none ever ran). Its `failed` VTXOs are the ones still
+    /// missing: they are kept locked until the server gives their status.
+    ///
+    /// When a recovery resumed after open is done, bark only logs its final
+    /// report; it cannot be read here. VTXOs it gave up on (`abandoned`) stay
+    /// locked, so they still show in `vtxos`.
+    pub async fn pending_recovery(&self) -> Result<Option<types::RecoveryReport>, Error> {
+        let core = self.core.clone();
+        run_async(async move { core.pending_recovery().await }).await
+    }
+
+    /// Drive the recovery from seed in progress, if any, until it is done or
+    /// parks again. Does nothing while another drive holds its lock.
+    ///
+    /// This already runs as part of `sync`; call it to resume the recovery on
+    /// demand.
+    pub async fn sync_pending_recovery(&self) -> Result<(), Error> {
+        let core = self.core.clone();
+        run_async(async move { core.sync_pending_recovery().await }).await
     }
 
     // ------------------------------------------------------------------------
@@ -780,33 +808,80 @@ impl Wallet {
     // Boarding (requires onchain wallet)
     // ------------------------------------------------------------------------
 
+    /// Board `amount_sats` from the onchain wallet.
+    ///
+    /// `expiry_height` sets the block height at which the board VTXO expires.
+    /// It defaults to `Config.board_lifetime` blocks from the tip, capped at
+    /// the server's VTXO lifetime; an expiry beyond that lifetime, or too
+    /// close to the tip to confirm and register in time, is refused.
+    #[uniffi::method(default(expiry_height = None))]
     pub async fn board_amount(
         &self,
         amount_sats: u64,
+        expiry_height: Option<u32>,
     ) -> Result<types::PendingBoard, Error> {
         let core = self.core.clone();
-        run_async(async move { core.board_amount(amount_sats).await }).await
+        run_async(async move { core.board_amount(amount_sats, expiry_height).await }).await
     }
 
-    pub async fn board_all(&self) -> Result<types::PendingBoard, Error> {
+    /// Board all funds of the onchain wallet. See `board_amount` for
+    /// `expiry_height`.
+    #[uniffi::method(default(expiry_height = None))]
+    pub async fn board_all(&self, expiry_height: Option<u32>) -> Result<types::PendingBoard, Error> {
         let core = self.core.clone();
-        run_async(async move { core.board_all().await }).await
+        run_async(async move { core.board_all(expiry_height).await }).await
     }
 
-    pub async fn board_funding_address(&self) -> Result<types::BoardFundingInfo, Error> {
+    /// Derive a fresh key and return the address to fund a board with from
+    /// elsewhere, e.g. as a payjoin receiver. Persist the returned info and
+    /// pass it to `board_psbt` with the funding PSBT. See `board_amount` for
+    /// `expiry_height`.
+    #[uniffi::method(default(expiry_height = None))]
+    pub async fn board_funding_address(
+        &self,
+        expiry_height: Option<u32>,
+    ) -> Result<types::BoardFundingInfo, Error> {
         let core = self.core.clone();
-        run_async(async move { core.board_funding_address().await }).await
+        run_async(async move { core.board_funding_address(expiry_height).await }).await
     }
 
+    /// Rebuild the funding info of a funding address made before
+    /// `BoardFundingInfo` carried `user_pubkey`, from the `keypair_index` and
+    /// `expiry_height` stored alongside it.
+    ///
+    /// Only for boards funded through the old `board_funding_address`. If the
+    /// server's key or exit delta changed since, the rebuilt address won't
+    /// match and `board_psbt` refuses the PSBT.
+    pub async fn legacy_board_funding_address(
+        &self,
+        keypair_index: u32,
+        expiry_height: u32,
+    ) -> Result<types::BoardFundingInfo, Error> {
+        let core = self.core.clone();
+        run_async(async move {
+            core.legacy_board_funding_address(keypair_index, expiry_height).await
+        })
+        .await
+    }
+
+    /// Board from a funding PSBT paying the address of `funding`, made by
+    /// `board_funding_address`.
+    ///
+    /// A finalized PSBT is broadcast by bark; an unfinalized one leaves the
+    /// broadcast to another party and bark waits for the transaction to
+    /// appear. The board commits to the PSBT's txid, so if the other party
+    /// changes the transaction, call this again with the new PSBT and the
+    /// same `funding`.
+    ///
+    /// Fails once `funding` is too close to its expiry height; make a new
+    /// funding address then.
     pub async fn board_psbt(
         &self,
         psbt_base64: String,
-        keypair_index: u32,
-        expiry_height: u32,
+        funding: types::BoardFundingInfo,
     ) -> Result<types::PendingBoard, Error> {
         let core = self.core.clone();
-        run_async(async move { core.board_psbt(psbt_base64, keypair_index, expiry_height).await })
-            .await
+        run_async(async move { core.board_psbt(psbt_base64, funding).await }).await
     }
 
     pub async fn sync_pending_boards(&self) -> Result<(), Error> {

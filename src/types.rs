@@ -945,13 +945,16 @@ impl From<BarkPendingBoard> for PendingBoard {
 // BoardFundingInfo
 // ============================================================================
 
-/// Destination for an externally funded board (e.g. a payjoin receive).
+/// Destination for an externally funded board (e.g. a payjoin receive),
+/// mirroring `bark::BoardFundingAddress`.
 ///
-/// The funding script commits to the derived keypair and expiry height, so
-/// `keypair_index` and `expiry_height` must be passed back unchanged to
-/// `board_psbt` once the funding PSBT is available — including on retries
-/// after the sender changes the transaction.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The funding script commits to `user_pubkey` and `expiry_height`, so persist
+/// this record and pass it back unchanged to `board_psbt` once the funding
+/// PSBT is available — including on retries after the sender changes the
+/// transaction. Fund it right away: the board VTXO's lifetime started when
+/// the address was made, and once it expires the server can sweep the funding
+/// output alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "wasm-web",
     derive(tsify::Tsify),
@@ -959,9 +962,55 @@ impl From<BarkPendingBoard> for PendingBoard {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct BoardFundingInfo {
+    /// Address the funding transaction must pay. Informational only:
+    /// `board_psbt` rebuilds the funding script from `user_pubkey` and
+    /// `expiry_height` and does not read it.
     pub address: String,
+    /// Block height at which the board VTXO expires.
     pub expiry_height: u32,
-    pub keypair_index: u32,
+    /// Hex-encoded wallet public key the board VTXO is locked to.
+    pub user_pubkey: String,
+}
+
+/// `bark::BoardFundingAddress` keeps its fields private and only exposes them
+/// through serde, so convert through its serialized form.
+#[derive(Serialize, Deserialize)]
+struct BarkBoardFundingAddress {
+    address: String,
+    user_pubkey: String,
+    expiry_height: u32,
+}
+
+impl TryFrom<&bark::BoardFundingAddress> for BoardFundingInfo {
+    type Error = crate::error::Error;
+
+    fn try_from(f: &bark::BoardFundingAddress) -> Result<Self, Self::Error> {
+        let value = serde_json::to_value(f)
+            .map_err(|e| format!("failed to encode board funding address: {}", e))?;
+        let raw: BarkBoardFundingAddress = serde_json::from_value(value)
+            .map_err(|e| format!("failed to decode board funding address: {}", e))?;
+        Ok(Self {
+            address: raw.address,
+            expiry_height: raw.expiry_height,
+            user_pubkey: raw.user_pubkey,
+        })
+    }
+}
+
+impl TryFrom<BoardFundingInfo> for bark::BoardFundingAddress {
+    type Error = crate::error::Error;
+
+    fn try_from(f: BoardFundingInfo) -> Result<Self, Self::Error> {
+        let raw = BarkBoardFundingAddress {
+            address: f.address,
+            user_pubkey: f.user_pubkey,
+            expiry_height: f.expiry_height,
+        };
+        let value = serde_json::to_value(raw)
+            .map_err(|e| format!("failed to encode board funding info: {}", e))?;
+        Ok(serde_json::from_value(value)
+            .map_err(|e| format!("invalid board funding info: {}", e))?)
+    }
 }
 
 // ============================================================================
@@ -1148,6 +1197,8 @@ pub struct ArkInfo {
     /// Maximum exit depth (genesis chain length) allowed for a VTXO before the
     /// server refuses to cosign further OOR transactions spending it.
     pub max_vtxo_exit_depth: u16,
+    /// Maximum number of outputs of a single round participation.
+    pub max_round_participation_outputs: u32,
 }
 
 impl From<&bark::ark::ArkInfo> for ArkInfo {
@@ -1177,6 +1228,8 @@ impl From<&bark::ark::ArkInfo> for ArkInfo {
             ln_receive_anti_dos_required: info.ln_receive_anti_dos_required,
             fee_schedule: (&info.fees).into(),
             max_vtxo_exit_depth: info.max_vtxo_exit_depth,
+            max_round_participation_outputs: u32::try_from(info.max_round_participation_outputs)
+                .unwrap_or(u32::MAX),
         }
     }
 }
@@ -1244,8 +1297,13 @@ pub enum ExitTxStatus {
     },
     /// Confirmed in a block.
     Confirmed {
+        /// Deprecated: a confirmed exit tx no longer tracks its CPFP child.
+        /// Always empty, kept for compatibility.
         child_txid: String,
+        /// The block that confirmed the exit tx.
         block: BlockRef,
+        /// Deprecated: use `block`. Always a `Block` origin confirmed in
+        /// `block`, kept for compatibility.
         origin: ExitTxOrigin,
     },
 }
@@ -1265,11 +1323,14 @@ impl From<&bark::exit::ExitTxStatus> for ExitTxStatus {
                 child_txid: child_txid.to_string(),
                 origin: origin.into(),
             },
-            B::Confirmed { child_txid, block, origin } => Self::Confirmed {
-                child_txid: child_txid.to_string(),
-                block: block.into(),
-                origin: origin.into(),
-            },
+            B::Confirmed { block } => {
+                let block = BlockRef::from(block);
+                Self::Confirmed {
+                    child_txid: String::new(),
+                    block: block.clone(),
+                    origin: ExitTxOrigin::Block { confirmed_in: block },
+                }
+            }
         }
     }
 }
@@ -2048,8 +2109,8 @@ impl From<StoredRoundState<Unlocked>> for RoundState {
 /// One bucket of a [`RecoveryReport`].
 ///
 /// `total_sats` only sums the VTXOs whose amount is known, so it can
-/// under-count `failed`, where a VTXO may have failed before being fetched.
-/// `vtxo_ids` is sorted, since upstream buckets them unordered.
+/// under-count `failed`, `abandoned` and `not_found`, where a VTXO may not
+/// have been fetched. `vtxo_ids` is sorted as strings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "wasm-web",
@@ -2119,8 +2180,10 @@ impl From<ImportVtxoArgs> for bark::ImportVtxoArgs {
 /// `skipped` vs `failed` is the load-bearing distinction: a `skipped` VTXO was
 /// decided not to be spendable (spent, exited, or reported non-spendable),
 /// while a `failed` one could not be decided because of an error, so its funds
-/// may still be missing. `failed` is retryable via `recover_vtxos`; a `foreign`
-/// id instead sits beyond the key-derivation gap limit and needs a wider scan.
+/// may still be missing. `failed` is retried by every sync while a seed
+/// recovery is in progress, and via `recover_vtxos`; an `abandoned` one was
+/// given up on after too many attempts; a `foreign` id instead sits beyond the
+/// key-derivation gap limit and needs a wider scan.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "wasm-web",
@@ -2146,13 +2209,23 @@ pub struct RecoveryReport {
     pub failed: RecoveryBucket,
     /// Already fully exited on-chain.
     pub exited: RecoveryBucket,
-    /// Whether the scan accounted for every VTXO: no `failed`, no `foreign`.
+    /// Reported unknown by the server. Recovery trusts the server, so these
+    /// are not retried.
+    pub not_found: RecoveryBucket,
+    /// Given up on after `MAX_RECOVERY_ATTEMPTS` (40) attempts the server or
+    /// the chain answered without deciding. Funds may be missing. One with a
+    /// stored body stays locked, as it may be spent, and a later
+    /// `recover_vtxos` tries it again.
+    pub abandoned: RecoveryBucket,
+    /// Whether the scan accounted for every VTXO: no `failed`, no `abandoned`,
+    /// no `foreign`.
     pub is_complete: bool,
 }
 
 impl From<&bark::RecoveryReportEntry> for RecoveryBucket {
     fn from(e: &bark::RecoveryReportEntry) -> Self {
-        // Upstream keeps entries in a HashMap, so sort for a stable order.
+        // Upstream orders by `VtxoId`, whose byte order differs from the
+        // displayed string; sort the strings for a stable, readable order.
         let mut vtxo_ids = e.ids().map(|id| id.to_string()).collect::<Vec<_>>();
         vtxo_ids.sort_unstable();
         Self { vtxo_ids, total_sats: e.total_amount().to_sat() }
@@ -2167,21 +2240,25 @@ impl From<&bark::RecoveryReport> for RecoveryReport {
             foreign: r.foreign().into(),
             failed: r.failed().into(),
             exited: r.exited().into(),
+            not_found: r.not_found().into(),
+            abandoned: r.abandoned().into(),
             is_complete: r.is_complete(),
         }
     }
 }
 
-/// Outcome of the seed-recovery scan `Wallet::open` runs, mirroring
+/// Outcome of the seed recovery as `Wallet::open` saw it, mirroring
 /// `bark::RecoveryStatus`.
 ///
-/// The three variants are distinguishable on purpose: `NotRun` means nothing
-/// was attempted (wallet already existed locally, or `skip_recovery` was set),
-/// `Failed` means the scan errored before producing a report so funds may be
-/// missing until a retry succeeds, and `Completed` carries the report — whose
-/// `is_complete` can still be `false` for individual VTXOs.
+/// The variants are distinguishable on purpose: `NotRun` means nothing was
+/// attempted (wallet already existed locally without a recovery in progress,
+/// or `skip_recovery` was set), `Failed` means the recovery could not be
+/// started or read back so funds may be missing, `InProgress` means it stopped
+/// before it was done and resumes on every sync, and `Completed` carries the
+/// final report — whose `is_complete` can still be `false` for individual
+/// VTXOs.
 ///
-/// Serde/TS tags: `"not-run"` | `"failed"` | `"completed"`.
+/// Serde/TS tags: `"not-run"` | `"failed"` | `"in-progress"` | `"completed"`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[cfg_attr(
@@ -2192,18 +2269,24 @@ impl From<&bark::RecoveryReport> for RecoveryReport {
 pub enum RecoveryStatus {
     /// No scan was attempted.
     NotRun,
-    /// The scan errored before it could produce a report.
+    /// The recovery could not be started or its state could not be read
+    /// back.
     Failed { message: String },
-    /// The scan ran to the end.
+    /// The recovery stopped before it was done, on an error or on VTXOs it
+    /// could not decide on yet. The report holds what it decided so far; its
+    /// `failed` VTXOs are kept locked. Every sync resumes the recovery, see
+    /// `Wallet::pending_recovery`.
+    InProgress { report: RecoveryReport },
+    /// The recovery is done: no VTXO is left failed.
     Completed { report: RecoveryReport },
 }
 
 impl RecoveryStatus {
-    /// The report, if the scan completed.
+    /// The report, if the recovery got far enough to produce one.
     pub fn report(&self) -> Option<&RecoveryReport> {
         match self {
-            Self::Completed { report } => Some(report),
-            _ => None,
+            Self::InProgress { report } | Self::Completed { report } => Some(report),
+            Self::NotRun | Self::Failed { .. } => None,
         }
     }
 }
@@ -2214,6 +2297,7 @@ impl From<bark::RecoveryStatus> for RecoveryStatus {
             bark::RecoveryStatus::NotRun => Self::NotRun,
             // Alternate form joins the anyhow cause chain on one line.
             bark::RecoveryStatus::Failed(e) => Self::Failed { message: format!("{:#}", e) },
+            bark::RecoveryStatus::InProgress(r) => Self::InProgress { report: (&r).into() },
             bark::RecoveryStatus::Completed(r) => Self::Completed { report: (&r).into() },
         }
     }
@@ -2289,10 +2373,24 @@ impl From<&bark_bitcoin_ext::BlockRef> for BlockRef {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct CpfpParams {
+    /// Hex-encoded zero-fee parent transaction to bump through its P2A anchor
     pub tx_hex: String,
+    /// `"Effective"` for a fresh child, `"Rbf"` to replace a child already in
+    /// the mempool. The `Rbf`-only fields below are `None` for `"Effective"`.
     pub fees_type: String,
+    /// Effective fee rate the whole package (parent + child) must reach, in
+    /// sat/vB rounded up
     pub effective_fee_rate_sat_per_vb: u64,
-    pub current_package_fee_sats: Option<u64>,
+    /// `Rbf` only: total fee of the transactions the new child replaces
+    pub replaced_fee_sats: Option<u64>,
+    /// `Rbf` only: fee rate of the transactions the new child replaces, in
+    /// sat/vB rounded up
+    pub replaced_fee_rate_sat_per_vb: Option<u64>,
+    /// `Rbf` only: the node's incremental relay fee, in sat/vB rounded up
+    pub incremental_relay_fee_sat_per_vb: Option<u64>,
+    /// `Rbf` only: whether the parent is already in the mempool. If not, the
+    /// parent is part of the replacement.
+    pub parent_in_mempool: Option<bool>,
 }
 
 // ============================================================================
@@ -3101,6 +3199,17 @@ mod tests {
     }
 
     #[test]
+    fn exit_tx_status_confirmed_keeps_compat_fields() {
+        let upstream = bark::exit::ExitTxStatus::Confirmed { block: block_ref(42, 0x0b) };
+        let ExitTxStatus::Confirmed { child_txid, block, origin } = (&upstream).into() else {
+            panic!("expected confirmed");
+        };
+        assert_eq!(block, BlockRef::from(&block_ref(42, 0x0b)));
+        assert!(child_txid.is_empty());
+        assert!(matches!(origin, ExitTxOrigin::Block { confirmed_in } if confirmed_in == block));
+    }
+
+    #[test]
     fn exit_state_serde_tags_match_bark_web_domain() {
         // bark-web's domain type expects kebab-case `type` tags with
         // camelCase fields (same shape barkd serves). Guard the contract.
@@ -3382,6 +3491,45 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // BoardFundingInfo (bark 0.9.0)
+    // ------------------------------------------------------------------
+
+    fn board_funding_info() -> (BoardFundingInfo, bitcoin::Address) {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let pubkey = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[7; 32]).unwrap());
+        let address = bitcoin::Address::p2tr(
+            &secp, pubkey.x_only_public_key().0, None, bitcoin::Network::Regtest,
+        );
+        let info = BoardFundingInfo {
+            address: address.to_string(),
+            expiry_height: 1_234,
+            user_pubkey: pubkey.to_string(),
+        };
+        (info, address)
+    }
+
+    /// Upstream only exposes the fields through serde, so a renamed field
+    /// there would break `board_psbt` on funding info persisted by callers.
+    #[test]
+    fn board_funding_info_round_trips_through_bark() {
+        let (info, address) = board_funding_info();
+        let upstream = bark::BoardFundingAddress::try_from(info.clone()).unwrap();
+        assert_eq!(upstream.address(), &address);
+        assert_eq!(upstream.expiry_height().to_u32(), 1_234);
+        assert_eq!(BoardFundingInfo::try_from(&upstream).unwrap(), info);
+    }
+
+    #[test]
+    fn board_funding_info_with_a_bad_pubkey_is_refused() {
+        let (mut info, _) = board_funding_info();
+        info.user_pubkey = "not a pubkey".to_owned();
+        let err = bark::BoardFundingAddress::try_from(info)
+            .expect_err("a malformed pubkey should be refused");
+        assert!(err.message().contains("invalid board funding info"), "{}", err.message());
+    }
+
     #[test]
     fn recovery_status_not_run_has_no_report() {
         let status = RecoveryStatus::from(bark::RecoveryStatus::NotRun);
@@ -3416,6 +3564,46 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["type"], serde_json::json!("completed"));
         assert!(json["report"].is_object(), "{json}");
+    }
+
+    #[test]
+    fn recovery_status_in_progress_exposes_report() {
+        let mut upstream = bark::RecoveryReport::default();
+        upstream.push_failed(vtxo_id(1), None);
+        let status = RecoveryStatus::from(bark::RecoveryStatus::InProgress(upstream));
+        let report = status.report().expect("in-progress carries a report");
+        assert_eq!(report.failed.vtxo_ids, vec![vtxo_id(1).to_string()]);
+        assert!(!report.is_complete);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["type"], serde_json::json!("in-progress"));
+        assert!(json["report"].is_object(), "{json}");
+    }
+
+    #[test]
+    fn recovery_report_maps_not_found_and_abandoned() {
+        let mut upstream = bark::RecoveryReport::default();
+        upstream.push_not_found(vtxo_id(2));
+        for _ in 0..bark::MAX_RECOVERY_ATTEMPTS {
+            upstream.push_failed_attempt(vtxo_id(3), Some(bitcoin::Amount::from_sat(1_000)));
+        }
+        let report = RecoveryReport::from(&upstream);
+        assert_eq!(report.not_found.vtxo_ids, vec![vtxo_id(2).to_string()]);
+        assert_eq!(report.abandoned.vtxo_ids, vec![vtxo_id(3).to_string()]);
+        assert_eq!(report.abandoned.total_sats, 1_000);
+        assert!(report.failed.vtxo_ids.is_empty());
+        // Abandoned funds may be missing, so the report is not complete.
+        assert!(!report.is_complete);
+    }
+
+    #[test]
+    fn recovery_bucket_ids_are_sorted_as_strings() {
+        // `VtxoId` orders vout 2 before vout 10, the strings the other way.
+        let id = |vout| ark::VtxoId::from(bitcoin::OutPoint { txid: txid(0x01), vout });
+        let mut upstream = bark::RecoveryReport::default();
+        upstream.push_not_found(id(2));
+        upstream.push_not_found(id(10));
+        let report = RecoveryReport::from(&upstream);
+        assert_eq!(report.not_found.vtxo_ids, vec![id(10).to_string(), id(2).to_string()]);
     }
 
     #[test]

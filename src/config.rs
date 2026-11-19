@@ -25,6 +25,14 @@ pub struct Config {
     pub vtxo_refresh_expiry_threshold: Option<u16>,
     #[cfg_attr(feature = "wasm-web", tsify(optional))]
     pub vtxo_exit_margin: Option<u16>,
+    /// The default lifetime of a board VTXO, in blocks.
+    ///
+    /// Capped at the server's `ArkInfo.vtxo_lifetime`. Override it per board
+    /// with the `expiry_height` argument of the board methods.
+    ///
+    /// Default: 432 (3 days) on mainnet, 4320 (30 days) otherwise
+    #[cfg_attr(feature = "wasm-web", tsify(optional))]
+    pub board_lifetime: Option<u16>,
     #[cfg_attr(feature = "wasm-web", tsify(optional))]
     pub htlc_recv_claim_delta: Option<u16>,
     #[cfg_attr(feature = "wasm-web", tsify(optional))]
@@ -93,6 +101,9 @@ impl Config {
         if let Some(margin) = self.vtxo_exit_margin {
             ret.vtxo_exit_margin = margin.into();
         }
+        if let Some(lifetime) = self.board_lifetime {
+            ret.board_lifetime = lifetime.into();
+        }
         if let Some(delta) = self.htlc_recv_claim_delta {
             ret.htlc_recv_claim_delta = delta.into();
         }
@@ -153,6 +164,7 @@ mod tests {
             bitcoind_pass: None,
             vtxo_refresh_expiry_threshold: None,
             vtxo_exit_margin: None,
+            board_lifetime: None,
             htlc_recv_claim_delta: None,
             fallback_fee_rate: None,
             round_tx_required_confirmations: None,
@@ -188,6 +200,19 @@ mod tests {
         let err = config.into_bark(bitcoin::Network::Regtest)
             .expect_err("a gap limit above the maximum should be refused");
         assert!(err.message().contains("above the maximum"), "{}", err.message());
+    }
+
+    #[test]
+    fn board_lifetime_defaults_per_network_and_is_forwarded() {
+        let cfg = minimal().into_bark(bitcoin::Network::Bitcoin).unwrap();
+        assert_eq!(cfg.board_lifetime.to_u16(), 432);
+        let cfg = minimal().into_bark(bitcoin::Network::Regtest).unwrap();
+        assert_eq!(cfg.board_lifetime.to_u16(), 4320);
+
+        let mut config = minimal();
+        config.board_lifetime = Some(1_000);
+        let cfg = config.into_bark(bitcoin::Network::Regtest).unwrap();
+        assert_eq!(cfg.board_lifetime.to_u16(), 1_000);
     }
 
     /// bark counts confirmations in a `u16`; the FFI field is a `u32`.

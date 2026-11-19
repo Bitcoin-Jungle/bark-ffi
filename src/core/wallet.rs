@@ -42,8 +42,8 @@ pub struct OpenArgs {
     pub onchain: Option<Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>>,
     pub create_if_not_exists: bool,
     pub create_without_server: bool,
-    /// Skip the seed-recovery mailbox scan that otherwise runs when this open
-    /// creates the wallet locally.
+    /// Skip the seed recovery that otherwise starts when this open creates
+    /// the wallet locally.
     pub skip_recovery: bool,
 }
 
@@ -136,6 +136,23 @@ fn describe_state(state: &types::VtxoState) -> String {
     }
 }
 
+/// One-liner of a recovery report's bucket sizes, for logs.
+fn recovery_summary(report: &types::RecoveryReport) -> String {
+    format!(
+        "{} recovered ({} sats), {} skipped, {} exited, {} not found, {} foreign, \
+         {} failed, {} abandoned, complete={}",
+        report.recovered.vtxo_ids.len(),
+        report.recovered.total_sats,
+        report.skipped.vtxo_ids.len(),
+        report.exited.vtxo_ids.len(),
+        report.not_found.vtxo_ids.len(),
+        report.foreign.vtxo_ids.len(),
+        report.failed.vtxo_ids.len(),
+        report.abandoned.vtxo_ids.len(),
+        report.is_complete,
+    )
+}
+
 #[allow(dead_code)] // some methods are wired only via the uniffi layer
 impl Wallet {
     /// Build from an already-constructed `bark::Wallet`. `pub(crate)` so binding
@@ -195,7 +212,7 @@ impl Wallet {
         let seed = seed_from_str(network, &mnemonic_or_seed)?;
         let mut args = args.into_bark();
 
-        // The seed recovery scan runs inside `bark::Wallet::open` and reports
+        // The seed recovery runs inside `bark::Wallet::open` and reports
         // through this callback, so stash its outcome and hand it to callers via
         // [`Self::recovery_status`] once open returns. Keeps the result
         // available without plumbing a foreign callback across the FFI.
@@ -209,16 +226,13 @@ impl Wallet {
                 types::RecoveryStatus::Failed { message } => {
                     warn!("[OPEN] Seed recovery FAILED, funds may be missing: {}", message)
                 },
+                types::RecoveryStatus::InProgress { report } => warn!(
+                    "[OPEN] Seed recovery in progress, resumes on every sync: {}",
+                    recovery_summary(report),
+                ),
                 types::RecoveryStatus::Completed { report } => info!(
-                    "[OPEN] Seed recovery finished: {} recovered ({} sats), {} skipped, \
-                     {} exited, {} foreign, {} failed, complete={}",
-                    report.recovered.vtxo_ids.len(),
-                    report.recovered.total_sats,
-                    report.skipped.vtxo_ids.len(),
-                    report.exited.vtxo_ids.len(),
-                    report.foreign.vtxo_ids.len(),
-                    report.failed.vtxo_ids.len(),
-                    report.is_complete,
+                    "[OPEN] Seed recovery finished: {}",
+                    recovery_summary(report),
                 ),
             }
             *sink.lock().unwrap() = Some(status);
@@ -245,23 +259,25 @@ impl Wallet {
         Ok(Self { inner, recovery_status })
     }
 
-    /// Outcome of the seed-recovery mailbox scan that ran during
-    /// [`Self::open`].
+    /// Outcome of the seed recovery as [`Self::open`] saw it. A snapshot: it
+    /// does not change after open, see [`Self::pending_recovery`] for the
+    /// live state.
     ///
-    /// Recovery only runs on the open that creates the wallet locally, and not
-    /// at all when `OpenArgs::skip_recovery` is set, so this is `NotRun` on
-    /// every subsequent open. `Failed` means the scan errored before producing
-    /// a report — upstream logs that and lets open succeed — so funds may be
-    /// missing until a retry; `Completed` carries the report, and a report
-    /// with `is_complete == false` means funds may still be missing. Retry
-    /// `failed` ids with [`Self::recover_vtxos`].
+    /// Recovery starts on the open that creates the wallet locally, unless
+    /// `OpenArgs::skip_recovery` is set. A later open reports `InProgress`
+    /// while that recovery is not done, and `NotRun` otherwise. `Failed` means
+    /// the recovery could not be started or read back — upstream logs that and
+    /// lets open succeed — so funds may be missing. `InProgress` means it
+    /// stopped before it was done; every sync resumes it. `Completed` carries
+    /// the final report, and `is_complete == false` there means funds may
+    /// still be missing.
     pub fn recovery_status(&self) -> types::RecoveryStatus {
         self.recovery_status.clone()
     }
 
-    /// The report of the seed-recovery scan that ran during [`Self::open`],
-    /// or `None` if the scan did not complete. Use [`Self::recovery_status`]
-    /// to tell a scan that failed apart from one that never ran.
+    /// The report of the seed recovery as [`Self::open`] saw it, or `None`
+    /// if it did not run or failed. Use [`Self::recovery_status`] to tell
+    /// these apart.
     pub fn recovery_report(&self) -> Option<types::RecoveryReport> {
         self.recovery_status.report().cloned()
     }
@@ -1219,9 +1235,14 @@ impl Wallet {
     /// Recover the given VTXO ids from the server: fetch each one, keep the
     /// ones this wallet owns and that are still spendable, and import them.
     ///
-    /// Takes known ids only — the full seed-derived mailbox rescan is internal
-    /// to bark and runs at wallet open (see [`Self::recovery_status`]). Use this
-    /// to retry ids a previous scan reported as `failed`.
+    /// Takes known ids only — the full recovery from seed is internal to bark,
+    /// starts at wallet open and resumes on every sync (see
+    /// [`Self::recovery_status`] and [`Self::pending_recovery`]). Use this to
+    /// retry ids a previous recovery reported as `failed` or `abandoned`; a
+    /// VTXO an earlier recovery left locked is tried again.
+    ///
+    /// Fails while a recovery from seed is being driven, as both work on the
+    /// same locked VTXOs.
     ///
     /// `gap_limit` overrides [`Config::vtxo_key_gap_limit`] for the key scan
     /// that decides which of `vtxo_ids` this wallet owns. Widen it to reach ids
@@ -1238,6 +1259,28 @@ impl Wallet {
 
         let report = self.inner.recover_vtxos(ids?, gap_limit).await?;
         Ok((&report).into())
+    }
+
+    /// The report of the recovery from seed in progress, or `None` once it is
+    /// done (or if none ever ran). Its `failed` VTXOs are the ones still
+    /// missing: they are kept locked until the server gives their status.
+    ///
+    /// When a recovery resumed after open is done, bark only logs its final
+    /// report; it cannot be read here. VTXOs it gave up on (`abandoned`) stay
+    /// locked, so they still show in [`Self::vtxos`].
+    pub async fn pending_recovery(&self) -> Result<Option<types::RecoveryReport>, Error> {
+        let recovery = self.inner.pending_recovery().await?;
+        Ok(recovery.map(|r| (&r.report).into()))
+    }
+
+    /// Drive the recovery from seed in progress, if any, until it is done or
+    /// parks again. Does nothing while another drive holds its lock.
+    ///
+    /// This already runs as part of [`Self::sync`]; expose it so callers can
+    /// resume the recovery on demand.
+    pub async fn sync_pending_recovery(&self) -> Result<(), Error> {
+        self.inner.sync_pending_recovery().await?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------------
@@ -1273,6 +1316,7 @@ impl Wallet {
             bitcoind_pass: None,
             vtxo_refresh_expiry_threshold: Some(cfg.vtxo_refresh_expiry_threshold.to_u16()),
             vtxo_exit_margin: Some(cfg.vtxo_exit_margin.to_u16()),
+            board_lifetime: Some(cfg.board_lifetime.to_u16()),
             htlc_recv_claim_delta: Some(cfg.htlc_recv_claim_delta.to_u16()),
             fallback_fee_rate: cfg.fallback_fee_rate.map(|r| r.to_sat_per_kwu()),
             round_tx_required_confirmations: Some(cfg.round_tx_required_confirmations.to_u32()),
@@ -1304,16 +1348,34 @@ impl Wallet {
     // Boarding (requires onchain wallet)
     // ------------------------------------------------------------------------
 
+    /// A board builder, expiring at `expiry_height` when given.
+    ///
+    /// Without one, the board VTXO expires `Config.board_lifetime` blocks from
+    /// the tip, capped at the server's VTXO lifetime. An expiry beyond the
+    /// server's VTXO lifetime, or too close to the tip to confirm and register
+    /// in time, is refused.
+    fn board_builder(&self, expiry_height: Option<u32>) -> bark::BoardBuilder<'_> {
+        let builder = self.inner.board();
+        match expiry_height {
+            Some(height) => builder.expiry(height.into()),
+            None => builder,
+        }
+    }
+
+    /// Board `amount_sats` from the onchain wallet. See [`Self::board_builder`]
+    /// for `expiry_height`.
     pub async fn board_amount(
         &self,
         amount_sats: u64,
+        expiry_height: Option<u32>,
     ) -> Result<types::PendingBoard, Error> {
         let amount = bitcoin::Amount::from_sat(amount_sats);
         info!("[BOARD] Boarding {} sats into Ark...", amount_sats);
 
         let pb = self
-            .inner
-            .board_amount(amount)
+            .board_builder(expiry_height)
+            .amount(amount)
+            .build()
             .await
             .context("Board failed")?;
 
@@ -1328,12 +1390,15 @@ impl Wallet {
         Ok(pb.into())
     }
 
-    pub async fn board_all(&self) -> Result<types::PendingBoard, Error> {
+    /// Board all funds of the onchain wallet. See [`Self::board_builder`] for
+    /// `expiry_height`.
+    pub async fn board_all(&self, expiry_height: Option<u32>) -> Result<types::PendingBoard, Error> {
         info!("[BOARD] Boarding ALL funds into Ark...");
 
         let pb = self
-            .inner
-            .board_all()
+            .board_builder(expiry_height)
+            .all()
+            .build()
             .await
             .context("Board all failed")?;
 
@@ -1349,43 +1414,78 @@ impl Wallet {
         Ok(pb.into())
     }
 
-    pub async fn board_funding_address(&self) -> Result<types::BoardFundingInfo, Error> {
-        let (keypair, keypair_index) = self
-            .inner
-            .derive_store_next_keypair()
-            .await
-            .context("Failed to derive board keypair")?;
-
-        let (address, expiry_height) = self
-            .inner
-            .board_funding_address(&keypair)
+    /// Derive a fresh key and return the address to fund a board with from
+    /// elsewhere, e.g. as a payjoin receiver. Persist the returned info and
+    /// pass it to [`Self::board_psbt`] with the funding PSBT. See
+    /// [`Self::board_builder`] for `expiry_height`.
+    pub async fn board_funding_address(
+        &self,
+        expiry_height: Option<u32>,
+    ) -> Result<types::BoardFundingInfo, Error> {
+        let funding = self
+            .board_builder(expiry_height)
+            .funding_address()
             .await
             .context("Failed to get board funding address")?;
 
         info!(
-            "[BOARD] Board funding address: {} (keypair index: {}, expiry height: {})",
-            address, keypair_index, expiry_height
+            "[BOARD] Board funding address: {} (expiry height: {})",
+            funding.address(), funding.expiry_height(),
         );
 
-        Ok(types::BoardFundingInfo {
-            address: address.to_string(),
-            expiry_height: expiry_height.to_u32(),
-            keypair_index,
-        })
+        types::BoardFundingInfo::try_from(&funding)
     }
 
+    /// Rebuild the funding info of a funding address made before bark-ffi
+    /// returned `user_pubkey`, from the `keypair_index` and `expiry_height`
+    /// stored alongside it.
+    ///
+    /// Only for boards funded through the old `board_funding_address`. If the
+    /// server's key or exit delta changed since, the rebuilt address won't
+    /// match and [`Self::board_psbt`] refuses the PSBT.
+    pub async fn legacy_board_funding_address(
+        &self,
+        keypair_index: u32,
+        expiry_height: u32,
+    ) -> Result<types::BoardFundingInfo, Error> {
+        let keypair = self
+            .inner
+            .peek_keypair(keypair_index)
+            .await
+            .context("Unknown board keypair index")?;
+
+        #[allow(deprecated)]
+        let funding = self
+            .inner
+            .legacy_board_funding_address(keypair.public_key(), expiry_height.into())
+            .await
+            .context("Failed to rebuild board funding address")?;
+
+        types::BoardFundingInfo::try_from(&funding)
+    }
+
+    /// Board from a funding PSBT paying the address of `funding`, made by
+    /// [`Self::board_funding_address`].
+    ///
+    /// A finalized PSBT is broadcast by bark; an unfinalized one leaves the
+    /// broadcast to another party and bark waits for the transaction to
+    /// appear. The board commits to the PSBT's txid, so if the other party
+    /// changes the transaction, call this again with the new PSBT and the
+    /// same `funding`.
+    ///
+    /// Fails once `funding` is too close to its expiry height; make a new
+    /// funding address then.
     pub async fn board_psbt(
         &self,
         psbt_base64: String,
-        keypair_index: u32,
-        expiry_height: u32,
+        funding: types::BoardFundingInfo,
     ) -> Result<types::PendingBoard, Error> {
         use bitcoin::base64::prelude::*;
         use bitcoin::psbt::Psbt;
 
         info!(
-            "[BOARD] Boarding from funding PSBT (keypair index: {}, expiry height: {})...",
-            keypair_index, expiry_height
+            "[BOARD] Boarding from funding PSBT (address: {}, expiry height: {})...",
+            funding.address, funding.expiry_height
         );
 
         let psbt_bytes = BASE64_STANDARD
@@ -1393,15 +1493,11 @@ impl Wallet {
             .context("Invalid base64")?;
         let psbt = Psbt::deserialize(&psbt_bytes).context("Invalid PSBT")?;
 
-        let keypair = self
-            .inner
-            .peek_keypair(keypair_index)
-            .await
-            .context("Unknown board keypair index")?;
+        let funding = bark::BoardFundingAddress::try_from(funding)?;
 
         let pb = self
             .inner
-            .board_psbt(psbt, keypair, expiry_height.into())
+            .board_psbt(psbt, &funding)
             .await
             .context("Board psbt failed")?;
 
@@ -2357,6 +2453,7 @@ mod tests {
             bitcoind_pass: None,
             vtxo_refresh_expiry_threshold: None,
             vtxo_exit_margin: None,
+            board_lifetime: None,
             htlc_recv_claim_delta: None,
             fallback_fee_rate: None,
             round_tx_required_confirmations: None,
