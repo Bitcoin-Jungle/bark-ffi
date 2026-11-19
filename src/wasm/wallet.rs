@@ -320,6 +320,11 @@ impl Wallet {
         Self { core, onchain }
     }
 
+    #[cfg_attr(not(feature = "nwc"), allow(dead_code))]
+    pub(crate) fn core(&self) -> &CoreWallet {
+        &self.core
+    }
+
     async fn open_impl(
         network: Network,
         mnemonic_or_seed: String,
@@ -329,6 +334,13 @@ impl Wallet {
     ) -> Result<Wallet, JsError> {
         let btc_network = network.into();
         let seed = seed_from_str(btc_network, &mnemonic_or_seed)?;
+        #[cfg(feature = "nwc")]
+        let nwc_store = {
+            let wallet_db = args.indexed_db_name.clone()
+                // The name `platform_default` gives the wallet's database.
+                .unwrap_or_else(|| seed.fingerprint().to_string());
+            Arc::new(crate::wasm::nwc::IdbNwcStore::new(crate::wasm::nwc::nwc_db_name(&wallet_db)))
+        };
         let db = if let Some(db) = args.indexed_db_name {
             indexed_db_client(&db).await?
         } else {
@@ -344,6 +356,8 @@ impl Wallet {
             create_if_not_exists: args.create_if_not_exists,
             create_without_server: args.create_without_server,
             skip_recovery: args.skip_recovery,
+            #[cfg(feature = "nwc")]
+            nwc_store: Some(nwc_store),
         }).await?;
         Ok(Self::wrap(core, onchain))
     }
@@ -354,7 +368,7 @@ impl Drop for Wallet {
         // The daemon owns the mailbox/round/sync processes when `runDaemon` was
         // set. Without this its tasks outlive the handle. `stop_daemon` is a
         // no-op when no daemon is running.
-        self.core.inner().stop_daemon();
+        self.core.stop_daemon();
     }
 }
 
@@ -1465,8 +1479,7 @@ impl Wallet {
     /// already running is a no-op.
     #[wasm_bindgen(js_name = runDaemon)]
     pub fn run_daemon(&self) -> Result<(), JsError> {
-        self.core.inner().start_daemon().map_err(js_err)?;
-        Ok(())
+        Ok(self.core.start_daemon()?)
     }
 
     /// Stop the background daemon. A no-op when it isn't running.
@@ -1477,12 +1490,12 @@ impl Wallet {
     /// This also happens automatically on `free()`.
     #[wasm_bindgen(js_name = stopDaemon)]
     pub fn stop_daemon(&self) {
-        self.core.inner().stop_daemon();
+        self.core.stop_daemon();
     }
 
-    /// Stop the background daemon and wait until its tasks have finished, so
-    /// nothing runs in the background afterwards (e.g. before deleting the
-    /// wallet's database). No-op when no daemon is running.
+    /// Stop the background daemon. In the browser bark cancels the daemon but
+    /// cannot wait for it to finish, so unlike natively it may still be
+    /// running when this resolves. No-op when no daemon is running.
     #[wasm_bindgen(js_name = stopDaemonWait)]
     pub async fn stop_daemon_wait(&self) -> Result<(), JsError> {
         Ok(self.core.stop_daemon_wait().await?)

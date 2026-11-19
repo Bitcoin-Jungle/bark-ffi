@@ -79,6 +79,11 @@ impl Wallet {
         let inner = core.inner().clone();
         Arc::new(Self { core, inner })
     }
+
+    #[cfg_attr(not(feature = "nwc"), allow(dead_code))]
+    pub(crate) fn core(&self) -> &CoreWallet {
+        &self.core
+    }
 }
 
 /// Low-level function to initialize a wallet
@@ -129,6 +134,8 @@ impl Wallet {
     ) -> Result<Arc<Self>, Error> {
         run_async(async move {
             let datadir = resolve_datadir(&args.datadir)?;
+            #[cfg(feature = "nwc")]
+            let nwc_store = Arc::new(crate::muniffi::nwc::FileNwcStore::new(&datadir));
             let core = CoreWallet::open(network, mnemonic_or_seed, config, CoreOpenArgs {
                 persister: Some(open_sqlite_db(&datadir)?),
                 datadir: Some(datadir),
@@ -138,6 +145,8 @@ impl Wallet {
                 create_if_not_exists: args.create_if_not_exists,
                 create_without_server: args.create_without_server,
                 skip_recovery: args.skip_recovery,
+                #[cfg(feature = "nwc")]
+                nwc_store: Some(nwc_store),
             })
             .await?;
             Ok(Self::wrap(core))
@@ -1365,19 +1374,22 @@ impl Wallet {
     /// Start the background daemon. The onchain wallet used by the daemon is
     /// the one supplied to `Wallet::open` (see `WalletOpenArgs.onchain`).
     pub async fn run_daemon(&self) -> Result<(), Error> {
-        let inner = self.inner.clone();
-        run_async(async move { inner.start_daemon().map_err(Error::from) }).await?;
+        let core = self.core.clone();
+        run_async(async move { core.start_daemon() }).await?;
         Ok(())
     }
 
     pub async fn stop_daemon(&self) -> Result<(), Error> {
-        self.inner.stop_daemon();
+        self.core.stop_daemon();
         Ok(())
     }
 
-    /// Stop the background daemon and wait until its tasks have finished, so
-    /// nothing runs in the background afterwards (e.g. before deleting the
-    /// wallet's datadir). No-op when no daemon is running.
+    /// Stop the background daemon and wait until it has finished, e.g. before
+    /// deleting the wallet's datadir. No-op when no daemon is running.
+    ///
+    /// While another call already waits for the daemon, this returns at once
+    /// without waiting. A start made while it waits goes ahead, so the daemon
+    /// runs again after.
     pub async fn stop_daemon_wait(&self) -> Result<(), Error> {
         let core = self.core.clone();
         run_async(async move { core.stop_daemon_wait().await }).await
@@ -1386,6 +1398,6 @@ impl Wallet {
 
 impl Drop for Wallet {
     fn drop(&mut self) {
-        self.inner.stop_daemon();
+        self.core.stop_daemon();
     }
 }
