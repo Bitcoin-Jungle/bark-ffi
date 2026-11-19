@@ -2,4 +2,11 @@
 # fix, or does not apply here, add its id below with a reason. Keep it short.
 
 [advisories]
-ignore = []
+ignore = [
+    # Bundled SQLite < 3.54 can leak memory when it opens a crafted db + -wal
+    # pair. The fix needs rusqlite 0.41; bark-wallet and bdk_chain pin 0.31.
+    # We open the db in the datadir the app passes (open, wallet_exists,
+    # read_datadir_info), so an app is exposed only if those files did not come
+    # from its own wallet (an imported copy, a directory others can write).
+    "RUSTSEC-2026-0459",
+]

@@ -95,6 +95,17 @@ pub trait CustomOnchainWalletCallbacks: Send + Sync {
 
     /// Create a signed P2A CPFP transaction
     ///
+    /// The child spends the parent's P2A anchor and pays the fee for the
+    /// whole package: at least (parent vsize + child vsize) times
+    /// `effective_fee_rate_sat_per_vb`, the parent being zero-fee.
+    ///
+    /// For `fees_type == "Rbf"` the child replaces what already spends the
+    /// anchor, so bitcoind's replacement rules apply on top. With
+    /// `replacement_vsize` the child's vsize, plus the parent's when
+    /// `parent_in_mempool` is false, the child must also pay at least:
+    /// * `replaced_fee_sats + incremental_relay_fee_sat_per_vb * replacement_vsize`
+    /// * `(replaced_fee_rate_sat_per_vb + incremental_relay_fee_sat_per_vb) * replacement_vsize`
+    ///
     /// # Arguments
     /// * `params` - CPFP transaction parameters
     ///
@@ -130,6 +141,38 @@ pub struct CallbackWalletAdapter {
 impl CallbackWalletAdapter {
     pub fn new(callbacks: Arc<dyn CustomOnchainWalletCallbacks>) -> Self {
         Self { callbacks, last_balance: Mutex::new(None) }
+    }
+}
+
+/// Convert the parent `tx` and bark's fee target into the FFI-friendly CPFP
+/// params. Rates round up, so the child never pays less than bark asked for.
+fn cpfp_params(tx: &Transaction, fees: MakeCpfpFees) -> CpfpParams {
+    let tx_hex = hex::encode(bitcoin::consensus::serialize(tx));
+    match fees {
+        MakeCpfpFees::Effective(fr) => CpfpParams {
+            tx_hex,
+            fees_type: "Effective".to_string(),
+            effective_fee_rate_sat_per_vb: fr.to_sat_per_vb_ceil(),
+            replaced_fee_sats: None,
+            replaced_fee_rate_sat_per_vb: None,
+            incremental_relay_fee_sat_per_vb: None,
+            parent_in_mempool: None,
+        },
+        MakeCpfpFees::Rbf {
+            min_effective_fee_rate,
+            replaced_fee,
+            replaced_fee_rate,
+            incremental_relay_fee,
+            parent_in_mempool,
+        } => CpfpParams {
+            tx_hex,
+            fees_type: "Rbf".to_string(),
+            effective_fee_rate_sat_per_vb: min_effective_fee_rate.to_sat_per_vb_ceil(),
+            replaced_fee_sats: Some(replaced_fee.to_sat()),
+            replaced_fee_rate_sat_per_vb: Some(replaced_fee_rate.to_sat_per_vb_ceil()),
+            incremental_relay_fee_sat_per_vb: Some(incremental_relay_fee.to_sat_per_vb_ceil()),
+            parent_in_mempool: Some(parent_in_mempool),
+        },
     }
 }
 
@@ -326,27 +369,7 @@ impl OnchainWalletTrait for CallbackWalletAdapter {
         tx: &Transaction,
         fees: MakeCpfpFees,
     ) -> Result<Transaction, CpfpError> {
-        // Convert to FFI-friendly CPFP params
-        let tx_hex = hex::encode(bitcoin::consensus::serialize(tx));
-
-        let (fees_type, effective_rate, current_fee) = match fees {
-            MakeCpfpFees::Effective(fr) => ("Effective".to_string(), fr.to_sat_per_vb_ceil(), None),
-            MakeCpfpFees::Rbf {
-                min_effective_fee_rate,
-                current_package_fee,
-            } => (
-                "Rbf".to_string(),
-                min_effective_fee_rate.to_sat_per_vb_ceil(),
-                Some(current_package_fee.to_sat()),
-            ),
-        };
-
-        let params = CpfpParams {
-            tx_hex,
-            fees_type,
-            effective_fee_rate_sat_per_vb: effective_rate,
-            current_package_fee_sats: current_fee,
-        };
+        let params = cpfp_params(tx, fees);
 
         // Call callback
         let cpfp_tx_hex = self
@@ -438,5 +461,37 @@ mod tests {
 
         let two = tx_paying(&[(spk(1), 1000), (spk(1), 1000)]);
         check_pays(&two, &required).unwrap();
+    }
+
+    #[test]
+    fn cpfp_params_for_an_effective_target() {
+        let tx = tx_paying(&[(spk(1), 1000)]);
+        let params = cpfp_params(&tx, MakeCpfpFees::Effective(FeeRate::from_sat_per_vb_u32(5)));
+        assert_eq!(params.tx_hex, hex::encode(bitcoin::consensus::serialize(&tx)));
+        assert_eq!(params.fees_type, "Effective");
+        assert_eq!(params.effective_fee_rate_sat_per_vb, 5);
+        assert_eq!(params.replaced_fee_sats, None);
+        assert_eq!(params.replaced_fee_rate_sat_per_vb, None);
+        assert_eq!(params.incremental_relay_fee_sat_per_vb, None);
+        assert_eq!(params.parent_in_mempool, None);
+    }
+
+    #[test]
+    fn cpfp_params_for_a_replacement_round_rates_up() {
+        let tx = tx_paying(&[(spk(1), 1000)]);
+        let params = cpfp_params(&tx, MakeCpfpFees::Rbf {
+            min_effective_fee_rate: FeeRate::from_sat_per_vb_u32(10),
+            replaced_fee: Amount::from_sat(2_345),
+            // 1.5 sat/vB, which must not round down to 1.
+            replaced_fee_rate: FeeRate::from_sat_per_kwu(375),
+            incremental_relay_fee: FeeRate::from_sat_per_vb_u32(1),
+            parent_in_mempool: false,
+        });
+        assert_eq!(params.fees_type, "Rbf");
+        assert_eq!(params.effective_fee_rate_sat_per_vb, 10);
+        assert_eq!(params.replaced_fee_sats, Some(2_345));
+        assert_eq!(params.replaced_fee_rate_sat_per_vb, Some(2));
+        assert_eq!(params.incremental_relay_fee_sat_per_vb, Some(1));
+        assert_eq!(params.parent_in_mempool, Some(false));
     }
 }
