@@ -275,6 +275,12 @@ pub enum VtxoLockHolder {
     Action { id: String },
     /// A pre-action subsystem, keyed by its movement.
     Movement { id: u32 },
+    /// Scuttle: a VTXO received by arkoor that a server in expiry payout
+    /// mode does not report spendable yet. Credited once the server does.
+    MailboxReceive,
+    /// Scuttle: a round output that a server in expiry payout mode does not
+    /// report bound to this wallet's mailbox yet. Released once it does.
+    RoundPayoutCheck,
 }
 
 impl From<&bark::vtxo::VtxoLockHolder> for VtxoLockHolder {
@@ -282,6 +288,8 @@ impl From<&bark::vtxo::VtxoLockHolder> for VtxoLockHolder {
         match h {
             bark::vtxo::VtxoLockHolder::Action { id } => Self::Action { id: id.clone() },
             bark::vtxo::VtxoLockHolder::Movement { id } => Self::Movement { id: id.0 },
+            bark::vtxo::VtxoLockHolder::MailboxReceive => Self::MailboxReceive,
+            bark::vtxo::VtxoLockHolder::RoundPayoutCheck => Self::RoundPayoutCheck,
         }
     }
 }
@@ -293,6 +301,8 @@ impl From<VtxoLockHolder> for bark::vtxo::VtxoLockHolder {
             VtxoLockHolder::Movement { id } => Self::Movement {
                 id: bark::movement::MovementId::new(id),
             },
+            VtxoLockHolder::MailboxReceive => Self::MailboxReceive,
+            VtxoLockHolder::RoundPayoutCheck => Self::RoundPayoutCheck,
         }
     }
 }

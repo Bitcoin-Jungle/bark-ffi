@@ -136,6 +136,12 @@ fn describe_state(state: &types::VtxoState) -> String {
         types::VtxoState::Locked { holder: Some(h) } => match h {
             types::VtxoLockHolder::Action { id } => format!("locked by action {}", id),
             types::VtxoLockHolder::Movement { id } => format!("locked by movement {}", id),
+            types::VtxoLockHolder::MailboxReceive => {
+                "locked until the server reports it received".to_owned()
+            }
+            types::VtxoLockHolder::RoundPayoutCheck => {
+                "locked until the server reports its round output bound".to_owned()
+            }
         },
         types::VtxoState::Spent => "spent".to_owned(),
         types::VtxoState::Exited => "exited".to_owned(),
