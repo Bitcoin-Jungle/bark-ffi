@@ -3465,6 +3465,8 @@ mod tests {
         use bitcoin::Amount;
 
         let upstream = af::FeeSchedule {
+            // scuttle: no separate same-server Lightning fees.
+            intra_ark: None,
             board: af::BoardFees {
                 min_fee: Amount::from_sat(100),
                 base_fee: Amount::from_sat(10),
