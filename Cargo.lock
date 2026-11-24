@@ -79,7 +79,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "ark-lib"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "async-trait",
  "bark-bitcoin-ext",
@@ -222,7 +222,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "bark-bitcoin-ext"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "bdk_bitcoind_rpc",
  "bdk_wallet",
@@ -239,7 +239,7 @@ dependencies = [
 [[package]]
 name = "bark-common"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "anyhow",
  "serde",
@@ -281,7 +281,7 @@ dependencies = [
 [[package]]
 name = "bark-nwc"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "anyhow",
  "bark-bitcoin-ext",
@@ -303,7 +303,7 @@ dependencies = [
 [[package]]
 name = "bark-runtime"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "futures",
  "gloo-timers",
@@ -316,7 +316,7 @@ dependencies = [
 [[package]]
 name = "bark-server-rpc"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "ark-lib",
  "bitcoin",
@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "bark-wallet"
 version = "0.9.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -522,7 +522,7 @@ checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
 [[package]]
 name = "bip321"
 version = "0.4.0"
-source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=083194b4000a753506c4cf21c27839b295484d0b#083194b4000a753506c4cf21c27839b295484d0b"
+source = "git+https://github.com/Bitcoin-Jungle/scuttle?rev=bbaad31d6951d4ae1c0a6f90afe44197634aaf13#bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 dependencies = [
  "bitcoin",
  "lightning",
