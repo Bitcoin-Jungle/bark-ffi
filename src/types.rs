@@ -275,6 +275,12 @@ pub enum VtxoLockHolder {
     Action { id: String },
     /// A pre-action subsystem, keyed by its movement.
     Movement { id: u32 },
+    /// Scuttle: a VTXO received by arkoor that a server in expiry payout
+    /// mode does not report spendable yet. Credited once the server does.
+    MailboxReceive,
+    /// Scuttle: a round output that a server in expiry payout mode does not
+    /// report bound to this wallet's mailbox yet. Released once it does.
+    RoundPayoutCheck,
 }
 
 impl From<&bark::vtxo::VtxoLockHolder> for VtxoLockHolder {
@@ -282,6 +288,8 @@ impl From<&bark::vtxo::VtxoLockHolder> for VtxoLockHolder {
         match h {
             bark::vtxo::VtxoLockHolder::Action { id } => Self::Action { id: id.clone() },
             bark::vtxo::VtxoLockHolder::Movement { id } => Self::Movement { id: id.0 },
+            bark::vtxo::VtxoLockHolder::MailboxReceive => Self::MailboxReceive,
+            bark::vtxo::VtxoLockHolder::RoundPayoutCheck => Self::RoundPayoutCheck,
         }
     }
 }
@@ -293,6 +301,8 @@ impl From<VtxoLockHolder> for bark::vtxo::VtxoLockHolder {
             VtxoLockHolder::Movement { id } => Self::Movement {
                 id: bark::movement::MovementId::new(id),
             },
+            VtxoLockHolder::MailboxReceive => Self::MailboxReceive,
+            VtxoLockHolder::RoundPayoutCheck => Self::RoundPayoutCheck,
         }
     }
 }
@@ -1120,6 +1130,25 @@ pub struct FeeSchedule {
     pub refresh: RefreshFees,
     pub lightning_receive: LightningReceiveFees,
     pub lightning_send: LightningSendFees,
+    /// Scuttle: the Lightning fees of a payment between two wallets of this
+    /// server, which never leaves it, in place of `lightning_send` and
+    /// `lightning_receive`. `None` when the server charges those as usual.
+    pub intra_ark: Option<IntraArkFees>,
+}
+
+/// Scuttle: same-server Lightning fees, mirroring `ark::fees::IntraArkFees`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "wasm-web",
+    derive(tsify::Tsify),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct IntraArkFees {
+    /// Charged to the payer in place of `FeeSchedule::lightning_send`.
+    pub lightning_send: LightningSendFees,
+    /// Charged to the receiver in place of `FeeSchedule::lightning_receive`.
+    pub lightning_receive: LightningReceiveFees,
 }
 
 impl From<&ark::fees::FeeSchedule> for FeeSchedule {
@@ -1131,6 +1160,15 @@ impl From<&ark::fees::FeeSchedule> for FeeSchedule {
                     ppm: e.ppm.0,
                 })
                 .collect()
+        };
+        let receive = |r: &ark::fees::LightningReceiveFees| LightningReceiveFees {
+            base_fee_sats: r.base_fee.to_sat(),
+            ppm: r.ppm.0,
+        };
+        let send = |l: &ark::fees::LightningSendFees| LightningSendFees {
+            min_fee_sats: l.min_fee.to_sat(),
+            base_fee_sats: l.base_fee.to_sat(),
+            ppm_expiry_table: table(&l.ppm_expiry_table),
         };
         Self {
             board: BoardFees {
@@ -1147,15 +1185,12 @@ impl From<&ark::fees::FeeSchedule> for FeeSchedule {
                 base_fee_sats: f.refresh.base_fee.to_sat(),
                 ppm_expiry_table: table(&f.refresh.ppm_expiry_table),
             },
-            lightning_receive: LightningReceiveFees {
-                base_fee_sats: f.lightning_receive.base_fee.to_sat(),
-                ppm: f.lightning_receive.ppm.0,
-            },
-            lightning_send: LightningSendFees {
-                min_fee_sats: f.lightning_send.min_fee.to_sat(),
-                base_fee_sats: f.lightning_send.base_fee.to_sat(),
-                ppm_expiry_table: table(&f.lightning_send.ppm_expiry_table),
-            },
+            lightning_receive: receive(&f.lightning_receive),
+            lightning_send: send(&f.lightning_send),
+            intra_ark: f.intra_ark.as_ref().map(|i| IntraArkFees {
+                lightning_send: send(&i.lightning_send),
+                lightning_receive: receive(&i.lightning_receive),
+            }),
         }
     }
 }
@@ -3455,6 +3490,18 @@ mod tests {
         use bitcoin::Amount;
 
         let upstream = af::FeeSchedule {
+            // scuttle: free same-server Lightning receives, cheaper sends.
+            intra_ark: Some(af::IntraArkFees {
+                lightning_send: af::LightningSendFees {
+                    min_fee: Amount::ZERO,
+                    base_fee: Amount::from_sat(1),
+                    ppm_expiry_table: vec![],
+                },
+                lightning_receive: af::LightningReceiveFees {
+                    base_fee: Amount::ZERO,
+                    ppm: af::PpmFeeRate(0),
+                },
+            }),
             board: af::BoardFees {
                 min_fee: Amount::from_sat(100),
                 base_fee: Amount::from_sat(10),
@@ -3509,6 +3556,11 @@ mod tests {
         assert_eq!(json["refresh"]["ppmExpiryTable"][0]["expiryBlocksThreshold"], 144);
         assert_eq!(json["lightningReceive"]["ppm"], 600);
         assert_eq!(json["lightningSend"]["baseFeeSats"], 5);
+        let intra = ffi.intra_ark.as_ref().expect("intra-Ark fees");
+        assert_eq!(intra.lightning_send.base_fee_sats, 1);
+        assert_eq!(intra.lightning_receive.ppm, 0);
+        assert_eq!(json["intraArk"]["lightningSend"]["baseFeeSats"], 1);
+        assert_eq!(json["intraArk"]["lightningReceive"]["baseFeeSats"], 0);
     }
 
     // ------------------------------------------------------------------

@@ -47,20 +47,23 @@ nwc = ["bark/nwc", "dep:rustls"]
 
 [dependencies.ark]
 package = "ark-lib"
-git = "https://gitlab.com/ark-bitcoin/bark"
-rev = "bark-0.9.0"
+# scuttle: Bitcoin Jungle's fork of bark (expiry payout mode), posd-bullnym.
+git = "https://github.com/Bitcoin-Jungle/scuttle"
+rev = "bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 default-features = false
 
 [dependencies.bark]
 package = "bark-wallet"
-git = "https://gitlab.com/ark-bitcoin/bark"
-rev = "bark-0.9.0"
+# scuttle: Bitcoin Jungle's fork of bark (expiry payout mode), posd-bullnym.
+git = "https://github.com/Bitcoin-Jungle/scuttle"
+rev = "bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 default-features = false
 
 [dependencies.bark-bitcoin-ext]
 package = "bark-bitcoin-ext"
-git = "https://gitlab.com/ark-bitcoin/bark"
-rev = "bark-0.9.0"
+# scuttle: Bitcoin Jungle's fork of bark (expiry payout mode), posd-bullnym.
+git = "https://github.com/Bitcoin-Jungle/scuttle"
+rev = "bbaad31d6951d4ae1c0a6f90afe44197634aaf13"
 default-features = false
 
 [dependencies]
